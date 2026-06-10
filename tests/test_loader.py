@@ -36,7 +36,6 @@ class TestGetScheduler:
             "  provider: gcp\n"
             "  project_id: my-project\n"
             "  location: us-central1\n"
-            "  target_url: https://example.com/schedule\n"
         )
         mock_scheduler = MagicMock()
         mock_from_config.return_value = mock_scheduler
@@ -48,5 +47,4 @@ class TestGetScheduler:
             "provider": "gcp",
             "project_id": "my-project",
             "location": "us-central1",
-            "target_url": "https://example.com/schedule",
         })

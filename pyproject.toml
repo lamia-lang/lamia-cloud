@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lamia-cloud"
 dynamic = ["version"]
-description = "Cloud scheduling backend for Lamia (GCP Cloud Scheduler)."
+description = "Cloud scheduling backend for Lamia — deploy and run .lm scripts on GCP."
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
@@ -27,6 +27,11 @@ classifiers = [
 dependencies = [
     "lamia-lang>=0.1.0",
     "google-cloud-scheduler>=2.13.0",
+    "google-cloud-build>=3.20.0",
+    "google-cloud-run>=0.10.0",
+    "google-cloud-storage>=2.14.0",
+    "google-cloud-service-usage>=1.8.0",
+    "google-cloud-resource-manager>=1.3.0",
     "pyyaml>=6.0.0",
 ]
 
@@ -41,14 +46,15 @@ Homepage = "https://github.com/lamia-lang/lamia-cloud"
 Repository = "https://github.com/lamia-lang/lamia-cloud"
 Issues = "https://github.com/lamia-lang/lamia-cloud/issues"
 
-[tool.setuptools]
-packages = ["lamia_cloud"]
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["lamia_cloud*"]
 
-[tool.setuptools.package-dir]
-lamia_cloud = "src"
+[tool.setuptools.package-data]
+lamia_cloud = ["templates/*"]
 
 [tool.setuptools_scm]
-version_file = "src/_version.py"
+version_file = "src/lamia_cloud/_version.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

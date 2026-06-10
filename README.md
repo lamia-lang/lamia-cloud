@@ -1,6 +1,6 @@
 # lamia-cloud
 
-Cloud scheduling backend for [Lamia](https://github.com/lamia-lang/lamia). Currently supports GCP Cloud Scheduler.
+Cloud scheduling backend for [Lamia](https://github.com/lamia-lang/lamia). Scripts run entirely in the cloud — deployed and triggered automatically. Currently supports GCP.
 
 ## Installation
 
@@ -14,6 +14,23 @@ Or install this package directly:
 pip install lamia-cloud
 ```
 
+## Prerequisites
+
+- A GCP project with **billing enabled**
+  ```bash
+  gcloud billing projects link YOUR_PROJECT_ID --billing-account=YOUR_BILLING_ACCOUNT_ID
+  ```
+  To find your billing account ID: `gcloud billing accounts list`
+- Application Default Credentials: `gcloud auth application-default login`
+
+Enable the Service Usage API once (required to auto-enable everything else):
+
+```bash
+gcloud services enable serviceusage.googleapis.com --project=YOUR_PROJECT_ID
+```
+
+All other required APIs (Cloud Build, Cloud Run, Cloud Scheduler, etc.) are enabled automatically on first deploy.
+
 ## Quick Start
 
 1. Add a `cloud` section to your project's `config.yaml`:
@@ -23,7 +40,6 @@ cloud:
   provider: gcp
   project_id: my-gcp-project
   location: us-central1
-  target_url: https://my-cloud-run-service.run.app/schedule
 ```
 
 2. Authenticate:
@@ -32,11 +48,19 @@ cloud:
 gcloud auth application-default login
 ```
 
-3. Schedule:
+3. Schedule (deploys + creates trigger automatically):
 
 ```bash
 lamia schedule add my_script.lm --every day --remote
 ```
+
+## What Happens
+
+- Your `.lm` script is packaged and deployed as a Cloud Run service with the lamia runtime
+- Cloud Scheduler triggers it on your cron schedule
+- Logs flow to Cloud Logging
+- `lamia schedule list` shows status alongside local jobs
+- `lamia schedule remove <id>` tears everything down
 
 ## Development
 
@@ -56,24 +80,4 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The GitHub Actions workflow builds the package and publishes to PyPI automatically using trusted publishing (no API tokens needed — configure trusted publishing in your PyPI project settings).
-
-### Keeping lamia up-to-date with the latest lamia-cloud
-
-For development, install from the local checkout:
-
-```bash
-pip install -e /path/to/lamia-cloud
-```
-
-For production, pin to a version range in your requirements:
-
-```
-lamia-cloud>=0.1.0
-```
-
-Or always get the latest:
-
-```bash
-pip install --upgrade lamia-cloud
-```
+The GitHub Actions workflow builds and publishes to PyPI automatically using trusted publishing.
