@@ -5,8 +5,11 @@ Flow:
 2. Add Dockerfile + main.py handler + requirements.txt
 3. Upload to GCS as source tarball
 4. Submit Cloud Build to build the container
-5. Deploy the container to Cloud Run
+5. Deploy the container to Cloud Run (with Vertex AI IAM for LLM access)
 6. Return the Cloud Run service URL
+
+LLM authentication uses Vertex AI — the Cloud Run service account gets
+roles/aiplatform.user, so no API keys are needed at runtime.
 """
 
 import io
@@ -14,41 +17,11 @@ import logging
 import shutil
 import tarfile
 import tempfile
-import time
 from pathlib import Path
-from typing import Optional
-
-from lamia.env_loader import get_global_env_path, get_project_env_path
 
 logger = logging.getLogger(__name__)
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
-
-
-def _read_env_file(path: Path) -> dict[str, str]:
-    """Parse a .env file into key=value pairs, skipping comments and blanks."""
-    if not path.is_file():
-        return {}
-    result: dict[str, str] = {}
-    for line in path.read_text().splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        result[key.strip()] = value.strip()
-    return result
-
-
-def collect_secrets(project_root: Path) -> dict[str, str]:
-    """Collect API keys from project .env and global ~/.lamia/.env.
-
-    Priority: project-level overrides global (same as runtime behavior).
-    These are injected as Cloud Run env vars — never baked into images.
-    """
-    secrets: dict[str, str] = {}
-    secrets.update(_read_env_file(get_global_env_path()))
-    secrets.update(_read_env_file(get_project_env_path(project_root)))
-    return secrets
 
 
 def _service_name(schedule_id: str) -> str:
@@ -180,12 +153,11 @@ def deploy_cloud_run(
     service_name: str,
     image_name: str,
     script_name: str,
-    secrets: Optional[dict[str, str]] = None,
 ) -> str:
     """Deploy (or update) a Cloud Run service. Returns the service URL.
 
-    Secrets are passed as Cloud Run env vars (encrypted at rest by GCP,
-    never stored in Docker image layers).
+    LLM auth is handled by Vertex AI — the service account gets
+    roles/aiplatform.user so no API keys are injected.
     """
     from google.cloud import run_v2
 
@@ -193,10 +165,12 @@ def deploy_cloud_run(
     parent = f"projects/{project_id}/locations/{location}"
     full_name = f"{parent}/services/{service_name}"
 
-    env_vars = [run_v2.EnvVar(name="LAMIA_SCRIPT", value=script_name)]
-    if secrets:
-        for key, value in secrets.items():
-            env_vars.append(run_v2.EnvVar(name=key, value=value))
+    service_account = _ensure_service_account(project_id)
+
+    env_vars = [
+        run_v2.EnvVar(name="LAMIA_SCRIPT", value=script_name),
+        run_v2.EnvVar(name="GOOGLE_CLOUD_PROJECT", value=project_id),
+    ]
 
     container = run_v2.Container(
         image=image_name,
@@ -209,6 +183,7 @@ def deploy_cloud_run(
     service = run_v2.Service(
         template=run_v2.RevisionTemplate(
             containers=[container],
+            service_account=service_account,
             max_instance_request_concurrency=1,
             timeout={"seconds": 540},
         ),
@@ -239,6 +214,55 @@ def deploy_cloud_run(
     _allow_scheduler_invocation(project_id, location, service_name)
 
     return url
+
+
+def _ensure_service_account(project_id: str) -> str:
+    """Create lamia-runner service account with Vertex AI access if it doesn't exist."""
+    from google.cloud import iam_admin_v1
+    from google.cloud import resourcemanager_v3
+    from google.iam.v1 import iam_policy_pb2, policy_pb2
+
+    sa_email = f"lamia-runner@{project_id}.iam.gserviceaccount.com"
+    iam_client = iam_admin_v1.IAMClient()
+
+    try:
+        iam_client.get_service_account(
+            request={"name": f"projects/{project_id}/serviceAccounts/{sa_email}"}
+        )
+    except Exception as e:
+        if "NOT_FOUND" in str(e):
+            iam_client.create_service_account(
+                request={
+                    "name": f"projects/{project_id}",
+                    "account_id": "lamia-runner",
+                    "service_account": {"display_name": "Lamia Cloud Runner"},
+                }
+            )
+            logger.info(f"Created service account: {sa_email}")
+        else:
+            raise
+
+    rm_client = resourcemanager_v3.ProjectsClient()
+    resource = f"projects/{project_id}"
+    policy = rm_client.get_iam_policy(request={"resource": resource})
+
+    vertex_role = "roles/aiplatform.user"
+    member = f"serviceAccount:{sa_email}"
+
+    already_granted = False
+    for binding in policy.bindings:
+        if binding.role == vertex_role and member in binding.members:
+            already_granted = True
+            break
+
+    if not already_granted:
+        policy.bindings.append(
+            policy_pb2.Binding(role=vertex_role, members=[member])
+        )
+        rm_client.set_iam_policy(request={"resource": resource, "policy": policy})
+        logger.info(f"Granted {vertex_role} to {sa_email}")
+
+    return sa_email
 
 
 def _allow_scheduler_invocation(project_id: str, location: str, service_name: str) -> None:
@@ -288,10 +312,6 @@ def deploy(
     service_name = _service_name(schedule_id)
     image = _image_name(project_id, schedule_id)
 
-    secrets = collect_secrets(project_root)
-    if secrets:
-        logger.info(f"Injecting {len(secrets)} env var(s) into Cloud Run service")
-
     logger.info(f"Packaging {script_name} for deployment...")
     staging = package_deployment(project_root, script_name, schedule_id)
 
@@ -305,8 +325,8 @@ def deploy(
         logger.info("Submitting Cloud Build...")
         submit_build(project_id, source_uri, image)
 
-        logger.info("Deploying to Cloud Run...")
-        url = deploy_cloud_run(project_id, location, service_name, image, script_name, secrets=secrets)
+        logger.info("Deploying to Cloud Run with Vertex AI access...")
+        url = deploy_cloud_run(project_id, location, service_name, image, script_name)
 
         return url
     finally:
