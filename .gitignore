@@ -4,4 +4,6 @@ dist/
 build/
 *.pyc
 .DS_Store
-src/lamia_cloud/_version.py
+.pytest_cache/
+.venv/
+src/_version.py

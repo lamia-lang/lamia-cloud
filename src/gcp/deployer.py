@@ -21,7 +21,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-TEMPLATES_DIR = Path(__file__).parent / "templates"
+# templates/ lives at the lamia_cloud package root, one level above this gcp/ subpackage
+TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 
 
 def _service_name(schedule_id: str) -> str:

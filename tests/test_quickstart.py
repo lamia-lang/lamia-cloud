@@ -9,14 +9,24 @@ Run:
     LAMIA_CLOUD_TEST_PROJECT=my-project pytest tests/test_quickstart.py -v
 """
 
+import hashlib
 import os
 import time
 from pathlib import Path
 
 import pytest
 
+from lamia_cloud import get_scheduler
+from lamia_cloud.gcp import GCPCloudScheduler
+from lamia_cloud.types import CloudScheduleJob, CloudJobStatus
+
 SKIP_REASON = "Set LAMIA_CLOUD_TEST_PROJECT to run integration tests"
 PROJECT_ID = os.environ.get("LAMIA_CLOUD_TEST_PROJECT")
+
+
+def _generate_schedule_id(script: str, project_root: str) -> str:
+    raw = f"{project_root}:{script}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
 @pytest.fixture
@@ -45,14 +55,11 @@ def test_project(tmp_path):
 class TestQuickstart:
     def test_deploy_and_schedule(self, test_project):
         """Full cycle: deploy -> verify scheduler job exists -> remove."""
-        from lamia.scheduling.base import ScheduleJob, generate_schedule_id
-        from lamia_cloud import get_scheduler
-
         scheduler = get_scheduler(test_project)
         script_name = "hello.lm"
-        schedule_id = generate_schedule_id(script_name, str(test_project))
+        schedule_id = _generate_schedule_id(script_name, str(test_project))
 
-        job = ScheduleJob(
+        job = CloudScheduleJob(
             script=script_name,
             cron="0 12 * * *",
             schedule_id=schedule_id,
@@ -60,31 +67,22 @@ class TestQuickstart:
             project_root=test_project,
         )
 
-        # Deploy and schedule
         scheduler.install(job, lamia_bin="lamia")
 
-        # Verify Cloud Scheduler job was created
         assert scheduler.is_installed(job)
 
-        # Check status
-        from lamia.scheduling.base import JobStatus
         status = scheduler.get_status(job)
-        assert status == JobStatus.ACTIVE
+        assert status == CloudJobStatus.ACTIVE
 
-        # Get config
         config = scheduler.get_installed_config(job)
         assert config is not None
         assert config["schedule"] == "0 12 * * *"
 
-        # Cleanup
         scheduler.uninstall(job)
         assert not scheduler.is_installed(job)
 
     def test_get_scheduler_from_config(self, test_project):
         """Verify get_scheduler correctly loads from config.yaml."""
-        from lamia_cloud import get_scheduler
-        from lamia_cloud.gcp import GCPCloudScheduler
-
         scheduler = get_scheduler(test_project)
         assert isinstance(scheduler, GCPCloudScheduler)
         assert scheduler.project_id == PROJECT_ID

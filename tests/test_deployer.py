@@ -1,10 +1,10 @@
-"""Tests for lamia_cloud.deployer (packaging logic, no GCP required)."""
+"""Tests for lamia_cloud.gcp.deployer (packaging logic, no GCP required)."""
 
 import tarfile
 import io
 from pathlib import Path
 
-from lamia_cloud.deployer import package_deployment, create_source_tarball
+from lamia_cloud.gcp.deployer import package_deployment, create_source_tarball
 
 
 class TestPackageDeployment:

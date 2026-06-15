@@ -1,13 +1,12 @@
 """Config loader and scheduler factory.
 
-Reads the cloud section from config.yaml and returns a configured scheduler.
+Reads the cloud section from config.yaml and returns a configured CloudScheduler.
 """
 
 import yaml
 from pathlib import Path
 
-from lamia.scheduling.base import BaseScheduler
-
+from lamia_cloud.interfaces import CloudScheduler
 from lamia_cloud.gcp import GCPCloudScheduler
 
 _PROVIDERS = {
@@ -15,10 +14,12 @@ _PROVIDERS = {
 }
 
 
-def get_scheduler(project_root: Path) -> BaseScheduler:
+def get_scheduler(project_root: Path) -> CloudScheduler:
     """Load cloud config and return a configured scheduler instance.
 
-    This is the entry point called by lamia's CLI.
+    Only GCP is supported, so we return GCPCloudScheduler directly without
+    conditional provider checking beyond validating the config value.
+
     Raises ValueError if config is missing or invalid.
     """
     config_path = project_root / "config.yaml"
@@ -48,4 +49,5 @@ def get_scheduler(project_root: Path) -> BaseScheduler:
             f"Unsupported cloud provider '{provider}'. Supported: {supported}"
         )
 
+    # Only GCP is supported — returns GCPCloudScheduler without further branching
     return scheduler_cls.from_config(cloud_cfg)

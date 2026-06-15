@@ -1,4 +1,4 @@
-"""Tests for lamia_cloud.gcp."""
+"""Tests for lamia_cloud.gcp.scheduler."""
 
 import pytest
 from unittest.mock import patch, MagicMock
@@ -11,7 +11,7 @@ class TestGCPCloudScheduler:
         with pytest.raises(ValueError, match="cloud.project_id is required"):
             GCPCloudScheduler.from_config({"provider": "gcp", "location": "us-central1"})
 
-    @patch("lamia_cloud.gcp._enable_apis")
+    @patch("lamia_cloud.gcp.scheduler._enable_apis")
     def test_from_config_valid(self, mock_enable):
         scheduler = GCPCloudScheduler.from_config({
             "provider": "gcp",
@@ -21,7 +21,7 @@ class TestGCPCloudScheduler:
         assert scheduler.project_id == "proj"
         assert scheduler.location == "europe-west1"
 
-    @patch("lamia_cloud.gcp._enable_apis")
+    @patch("lamia_cloud.gcp.scheduler._enable_apis")
     def test_from_config_defaults_location(self, mock_enable):
         scheduler = GCPCloudScheduler.from_config({
             "provider": "gcp",

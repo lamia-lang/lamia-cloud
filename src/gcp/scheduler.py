@@ -7,12 +7,11 @@ The user only provides project_id and location. Everything else is automated.
 import json
 import logging
 import time
-from pathlib import Path
 from typing import Optional
 
-from lamia.scheduling.base import BaseScheduler, JobStatus, ScheduleJob
-
-from lamia_cloud.deployer import deploy, teardown
+from lamia_cloud.interfaces import CloudScheduler
+from lamia_cloud.types import CloudScheduleJob, CloudJobStatus
+from lamia_cloud.gcp.deployer import deploy, teardown
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +26,7 @@ def _enable_apis(project_id: str) -> None:
             "cloudbuild.googleapis.com",
             "run.googleapis.com",
             "storage.googleapis.com",
+            "aiplatform.googleapis.com",
         ]
         for api in apis:
             service_name = f"projects/{project_id}/services/{api}"
@@ -38,7 +38,7 @@ def _enable_apis(project_id: str) -> None:
         pass
 
 
-class GCPCloudScheduler(BaseScheduler):
+class GCPCloudScheduler(CloudScheduler):
     """GCP Cloud Scheduler backend with automatic deployment."""
 
     def __init__(self, *, project_id: str, location: str):
@@ -66,10 +66,10 @@ class GCPCloudScheduler(BaseScheduler):
         from google.cloud import scheduler_v1
         return scheduler_v1.CloudSchedulerClient()
 
-    def _job_name(self, job: ScheduleJob) -> str:
+    def _job_name(self, job: CloudScheduleJob) -> str:
         return f"{self._parent}/jobs/lamia-{job.schedule_id}"
 
-    def _build_scheduler_job(self, job: ScheduleJob, target_url: str):
+    def _build_scheduler_job(self, job: CloudScheduleJob, target_url: str):
         from google.cloud import scheduler_v1
 
         schedule = job.cron
@@ -93,7 +93,7 @@ class GCPCloudScheduler(BaseScheduler):
             ),
         )
 
-    def install(self, job: ScheduleJob, lamia_bin: str) -> None:
+    def install(self, job: CloudScheduleJob, lamia_bin: str) -> None:
         """Deploy the script to Cloud Run and create a Cloud Scheduler trigger."""
         logger.info(f"Deploying {job.script} to cloud...")
 
@@ -128,7 +128,7 @@ class GCPCloudScheduler(BaseScheduler):
                 logger.info(f"Cloud Scheduler not ready yet, retrying in 15s...")
                 time.sleep(15)
 
-    def uninstall(self, job: ScheduleJob) -> None:
+    def uninstall(self, job: CloudScheduleJob) -> None:
         """Remove both the Cloud Scheduler job and the Cloud Run service."""
         client = self._scheduler_client()
         from google.api_core.exceptions import Aborted, NotFound
@@ -147,7 +147,7 @@ class GCPCloudScheduler(BaseScheduler):
 
         teardown(self.project_id, self.location, job.schedule_id)
 
-    def is_installed(self, job: ScheduleJob) -> bool:
+    def is_installed(self, job: CloudScheduleJob) -> bool:
         client = self._scheduler_client()
         try:
             client.get_job(name=self._job_name(job))
@@ -155,18 +155,18 @@ class GCPCloudScheduler(BaseScheduler):
         except Exception:
             return False
 
-    def get_status(self, job: ScheduleJob) -> JobStatus:
+    def get_status(self, job: CloudScheduleJob) -> CloudJobStatus:
         client = self._scheduler_client()
         try:
             cloud_job = client.get_job(name=self._job_name(job))
             from google.cloud.scheduler_v1 import Job
             if cloud_job.state == Job.State.ENABLED:
-                return JobStatus.ACTIVE
-            return JobStatus.INACTIVE
+                return CloudJobStatus.ACTIVE
+            return CloudJobStatus.INACTIVE
         except Exception:
-            return JobStatus.UNKNOWN
+            return CloudJobStatus.UNKNOWN
 
-    def get_installed_config(self, job: ScheduleJob) -> Optional[dict]:
+    def get_installed_config(self, job: CloudScheduleJob) -> Optional[dict]:
         client = self._scheduler_client()
         try:
             cloud_job = client.get_job(name=self._job_name(job))

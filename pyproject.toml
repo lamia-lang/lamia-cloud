@@ -46,15 +46,18 @@ Homepage = "https://github.com/lamia-lang/lamia-cloud"
 Repository = "https://github.com/lamia-lang/lamia-cloud"
 Issues = "https://github.com/lamia-lang/lamia-cloud/issues"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["lamia_cloud*"]
+[project.entry-points."lamia.cloud_providers"]
+default = "lamia_cloud:LamiaCloudProvider"
+
+[tool.setuptools]
+package-dir = {"lamia_cloud" = "src", "lamia_cloud.gcp" = "src/gcp"}
+packages = ["lamia_cloud", "lamia_cloud.gcp"]
 
 [tool.setuptools.package-data]
 lamia_cloud = ["templates/*"]
 
 [tool.setuptools_scm]
-version_file = "src/lamia_cloud/_version.py"
+version_file = "src/_version.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
