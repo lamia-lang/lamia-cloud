@@ -17,23 +17,35 @@ logger = logging.getLogger(__name__)
 
 
 def _enable_apis(project_id: str) -> None:
-    """Enable all required GCP APIs automatically."""
+    """Enable all required GCP APIs automatically.
+
+    Service Usage API must be enabled first (bootstraps the rest).
+    Most GCP projects have it enabled by default.
+    """
     try:
         from google.cloud import service_usage_v1
         client = service_usage_v1.ServiceUsageClient()
         apis = [
+            "serviceusage.googleapis.com",
             "cloudscheduler.googleapis.com",
             "cloudbuild.googleapis.com",
             "run.googleapis.com",
             "storage.googleapis.com",
             "aiplatform.googleapis.com",
+            "iam.googleapis.com",
         ]
         for api in apis:
             service_name = f"projects/{project_id}/services/{api}"
             try:
                 client.enable_service(request={"name": service_name})
-            except Exception:
-                pass
+            except Exception as e:
+                if "SERVICE_DISABLED" in str(e) and "serviceusage" in api:
+                    logger.warning(
+                        f"Service Usage API not enabled. Run once:\n"
+                        f"  gcloud services enable serviceusage.googleapis.com "
+                        f"--project={project_id}"
+                    )
+                    return
     except ImportError:
         pass
 

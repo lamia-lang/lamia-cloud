@@ -1,6 +1,6 @@
 # lamia-cloud
 
-Cloud scheduling backend for [Lamia](https://github.com/lamia-lang/lamia). Scripts run entirely in the cloud — deployed and triggered automatically. Currently supports GCP.
+Cloud scheduling backend for [Lamia](https://github.com/lamia-lang/lamia). Deploy `.lm` scripts to run on a schedule in the cloud — fully automated. Currently supports GCP.
 
 ## Installation
 
@@ -8,22 +8,12 @@ Cloud scheduling backend for [Lamia](https://github.com/lamia-lang/lamia). Scrip
 pip install "lamia-lang[cloud]"
 ```
 
-Or install this package directly:
-
-```bash
-pip install lamia-cloud
-```
-
 ## Prerequisites
 
-- A GCP project with **billing enabled**
+- GCP project with billing enabled
 - Application Default Credentials: `gcloud auth application-default login`
-- Service Usage API enabled (required to auto-enable everything else):
-  ```bash
-  gcloud services enable serviceusage.googleapis.com --project=YOUR_PROJECT_ID
-  ```
 
-All other required APIs (Cloud Build, Cloud Run, Cloud Scheduler, Vertex AI) are enabled automatically on first deploy.
+All required GCP APIs (including Service Usage) are enabled automatically on first deploy.
 
 ## Quick Start
 
@@ -33,84 +23,65 @@ All other required APIs (Cloud Build, Cloud Run, Cloud Scheduler, Vertex AI) are
 cloud:
   provider: gcp
   project_id: my-gcp-project
-  location: us-central1
+  location: us-central1  # optional, default: us-central1
 ```
 
-2. Authenticate:
-
-```bash
-gcloud auth application-default login
-```
-
-3. Schedule (deploys + creates trigger automatically):
+2. Schedule your script with the `--remote` flag:
 
 ```bash
 lamia schedule add my_script.lm --every day --remote
 ```
 
-## Configuration
+The `--remote` flag tells lamia to deploy and run the script in the cloud instead of locally.
 
-The only configuration needed is in `config.yaml`:
+## Managing Schedules
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `cloud.provider` | Yes | Cloud provider (`gcp`) |
-| `cloud.project_id` | Yes | GCP project ID |
-| `cloud.location` | No | GCP region for Cloud Run deployment (default: `us-central1`) |
+```bash
+lamia schedule list              # shows all jobs (local + cloud) with live status
+lamia schedule add X --remote    # deploy and schedule a new cloud job
+lamia schedule remove <id>       # tears down cloud resources and removes the job
+```
 
-Authentication uses Application Default Credentials (ADC).
+## How It Works
 
-### Region Handling
+1. `lamia schedule add --remote` packages your project and deploys it as a Cloud Run service
+2. Cloud Scheduler triggers it on your cron schedule
+3. Logs are available in Cloud Logging
+4. `lamia schedule list` fetches live execution status from the cloud
 
-You only need to specify a single `location` — this is where your Cloud Run services are deployed. The LLM routing automatically handles provider-specific region requirements:
+## LLM on Cloud — Vertex AI
 
-- **Google models (Gemini)**: uses your configured `location`
-- **Anthropic models (Claude)**: automatically routes to `us-east5` (Anthropic's Vertex AI region), regardless of your Cloud Run location
+Scripts that use LLM calls run through **Vertex AI** on cloud. This gives you:
 
-This is transparent — your scripts don't need any changes.
+- **No API keys** — authentication via IAM, no keys to store, rotate, or leak
+- **Budget control** — Vertex AI quotas and billing alerts
+- **Secure by default** — no API key transport or storage, traffic stays within GCP
 
-### Vertex AI Model Access
+### Supported Models
 
-To use LLM features on cloud, accept the Vertex AI Terms of Service:
+| Provider | Cloud routing |
+|----------|--------------|
+| **Anthropic** (Claude) | Runs natively on Vertex AI — same models, same quality |
+| **Google** (Gemini) | Runs natively on Vertex AI |
+| **OpenAI** (GPT, o-series) | Automatically mapped to Gemini by tier (strong/medium/light) with runtime selection of the best available current Gemini model |
 
-1. Visit: https://console.cloud.google.com/vertex-ai?project=YOUR_PROJECT_ID
-2. Accept the terms when prompted
+Anthropic and Google models run as-is. OpenAI models are mapped because they're not available on Vertex AI — tier classification is stable while the selected Gemini model is discovered dynamically at runtime.
 
-lamia-cloud will attempt to open this URL automatically if model access fails.
+## Configuration Reference
 
-### OpenAI Model Fallback
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `cloud.provider` | Yes | — | Cloud provider (currently `gcp`) |
+| `cloud.project_id` | Yes | — | Your GCP project ID |
+| `cloud.location` | No | `us-central1` | Region for Cloud Run deployment |
 
-Scripts that use **OpenAI** models automatically fallback to Gemini modelswhen deployed to cloud. The reason for this is that OpenAI models are not available in Google Cloud as of now. Some of the mappings are:
+No environment variables are required.
 
-| OpenAI Model | Vertex AI Equivalent |
-|-------------|---------------------|
-| gpt-4o, gpt-4o-mini | gemini-2.0-flash |
-| gpt-4, o1-preview | gemini-1.5-pro |
-| gpt-3.5-turbo | gemini-2.0-flash |
+## Troubleshooting
 
-Anthropic models (Claude) route to Vertex AI's Anthropic endpoint in `us-east5`.
-
-## Security
-
-Cloud Run services are deployed with:
-- **Internal-only ingress** — only accepts traffic from within GCP (Cloud Scheduler, VPC)
-- **IAM authentication** — Cloud Scheduler authenticates via OIDC token signed by `lamia-runner`
-- **No public access** — services are never exposed to the internet
-- **No secrets in images** — `.env` files are excluded from container builds; API keys are managed via IAM
-
-### Service Account
-
-lamia-cloud creates a dedicated `lamia-runner` service account with minimal permissions:
-- `roles/aiplatform.user` — Vertex AI model access
-- `roles/run.invoker` — allows scheduler to invoke Cloud Run services
-
-## What Happens
-
-- Your `.lm` script is packaged and deployed as a Cloud Run service with the lamia runtime
-- Cloud Scheduler triggers it on your cron schedule via authenticated OIDC request
-- Logs flow to Cloud Logging
-- `lamia schedule list` shows status alongside local jobs
-- `lamia schedule remove <id>` tears everything down
+- If Vertex AI access is not enabled yet, lamia-cloud logs a project-specific URL and attempts to open it automatically in your browser:
+  `https://console.cloud.google.com/vertex-ai?project=<your-project-id>`
+- After accepting terms, re-run the schedule/install command once.
 
 ## Development
 
@@ -123,11 +94,7 @@ pytest
 
 ## Releasing
 
-Tag a version and push — CI handles the rest:
-
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
-
-The GitHub Actions workflow builds and publishes to PyPI automatically using trusted publishing.

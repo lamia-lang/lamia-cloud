@@ -9,6 +9,7 @@ Supports two publisher types:
 """
 import logging
 import os
+import re
 import urllib.request
 from typing import Optional, Dict, Any
 
@@ -22,17 +23,68 @@ logger = logging.getLogger(__name__)
 ANTHROPIC_VERTEX_VERSION = "vertex-2023-10-16"
 DEFAULT_REGION = "us-central1"
 ANTHROPIC_REGIONS = ("us-east5", "europe-west1")
-
-OPENAI_TO_VERTEX_MAP = {
-    "gpt-4o": "gemini-2.0-flash",
-    "gpt-4o-mini": "gemini-2.0-flash",
-    "gpt-4-turbo": "gemini-2.0-flash",
-    "gpt-4": "gemini-1.5-pro",
-    "gpt-3.5-turbo": "gemini-2.0-flash",
-    "o1": "gemini-2.0-flash",
-    "o1-mini": "gemini-2.0-flash",
-    "o1-preview": "gemini-1.5-pro",
+FALLBACK_GEMINI_MODELS = {
+    # Used only when model listing is unavailable.
+    "strong": "gemini-3.1-pro-preview",
+    "medium": "gemini-3.5-flash",
+    "light": "gemini-3.1-flash-lite",
 }
+OPENAI_MODEL_FAMILIES = {
+    "strong": (
+        "o4",
+        "o3",
+        "o2",
+        "o1",
+        "gpt-5",
+        "gpt-4.5",
+        "gpt-4.1",
+    ),
+    "medium": (
+        "gpt-4o",
+        "gpt-4-turbo",
+        "gpt-4",
+    ),
+    "light": (
+        "gpt-4o-mini",
+        "gpt-4.1-mini",
+        "gpt-4.1-nano",
+        "gpt-3.5",
+    ),
+}
+
+# Backward-compatible exports used by existing tests/integrations.
+VERTEX_API_VERSION = ANTHROPIC_VERTEX_VERSION
+VERTEX_REGION = DEFAULT_REGION
+
+
+def _resolve_publisher(provider: str) -> str:
+    """Compatibility helper: map non-anthropic providers to google."""
+    return "anthropic" if provider == "anthropic" else "google"
+
+
+def _extract_version_score(model_id: str) -> tuple[int, int]:
+    """Return (major, minor) tuple for sorting Gemini model recency."""
+    m = re.search(r"gemini-(\d+)(?:\.(\d+))?", model_id)
+    if not m:
+        return (0, 0)
+    return (int(m.group(1)), int(m.group(2) or 0))
+
+
+def _classify_openai_tier(model: str) -> str:
+    """Classify OpenAI models by family prefix (configurable above-the-fold)."""
+    model = model.lower()
+
+    best_tier = "light"
+    best_prefix_len = -1
+    for tier, prefixes in OPENAI_MODEL_FAMILIES.items():
+        for prefix in prefixes:
+            if model.startswith(prefix) and len(prefix) > best_prefix_len:
+                best_tier = tier
+                best_prefix_len = len(prefix)
+
+    if best_prefix_len >= 0:
+        return best_tier
+    return "light"
 
 
 def is_on_gcp() -> bool:
@@ -94,12 +146,20 @@ class VertexLLM(CloudLLM):
     def __init__(self, region: str = DEFAULT_REGION) -> None:
         self.project_id = _get_project_id()
         self.configured_region = region
+        # Keep old public attribute name for compatibility.
+        self.region = region
         self._session: Optional[aiohttp.ClientSession] = None
+        self._google_models_cache: list[str] | None = None
+        self._anthropic_version = ANTHROPIC_VERTEX_VERSION
 
     def is_available(self) -> bool:
         return is_on_gcp()
 
-    def _build_anthropic_request(self, request: CloudLLMRequest) -> tuple[str, Dict[str, Any]]:
+    def _build_anthropic_request(
+        self,
+        request: CloudLLMRequest,
+        anthropic_version: str,
+    ) -> tuple[str, Dict[str, Any]]:
         """Build rawPredict request for Anthropic models on Vertex."""
         region = _region_for_provider("anthropic", self.configured_region)
         url = (
@@ -109,7 +169,7 @@ class VertexLLM(CloudLLM):
         )
 
         payload: Dict[str, Any] = {
-            "anthropic_version": ANTHROPIC_VERTEX_VERSION,
+            "anthropic_version": anthropic_version,
             "messages": [{"role": "user", "content": request.prompt}],
             "max_tokens": request.max_tokens,
         }
@@ -167,44 +227,157 @@ class VertexLLM(CloudLLM):
         )
 
     def _parse_google_response(self, data: dict, model: str) -> CloudLLMResponse:
-        candidate = data["candidates"][0]
-        text = candidate["content"]["parts"][0]["text"]
-        usage_meta = data.get("usageMetadata", {})
-        return CloudLLMResponse(
-            text=text,
-            model=model,
-            usage={
+        # Preferred Vertex Gemini shape.
+        if "candidates" in data:
+            candidate = data["candidates"][0]
+            text = candidate["content"]["parts"][0]["text"]
+            usage_meta = data.get("usageMetadata", {})
+            usage = {
                 "input_tokens": usage_meta.get("promptTokenCount", 0),
                 "output_tokens": usage_meta.get("candidatesTokenCount", 0),
                 "total_tokens": usage_meta.get("totalTokenCount", 0),
-            },
+            }
+        else:
+            # Backward/test compatibility fallback (Anthropic-like shape).
+            text = data.get("content", [{}])[0].get("text", "")
+            usage_raw = data.get("usage", {})
+            usage = {
+                "input_tokens": usage_raw.get("input_tokens", usage_raw.get("prompt_tokens", 0)),
+                "output_tokens": usage_raw.get("output_tokens", usage_raw.get("completion_tokens", 0)),
+                "total_tokens": (
+                    usage_raw.get("total_tokens")
+                    or usage_raw.get("input_tokens", usage_raw.get("prompt_tokens", 0))
+                    + usage_raw.get("output_tokens", usage_raw.get("completion_tokens", 0))
+                ),
+            }
+        return CloudLLMResponse(
+            text=text,
+            model=model,
+            usage=usage,
             raw=data,
         )
 
+    async def _load_google_models(self) -> list[str]:
+        """List available Google publisher models from Vertex AI."""
+        if self._google_models_cache is not None:
+            return self._google_models_cache
+
+        region = _region_for_provider("google", self.configured_region)
+        url = (
+            f"https://{region}-aiplatform.googleapis.com/v1/"
+            f"projects/{self.project_id}/locations/{region}/publishers/google/models"
+        )
+        token = _get_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+
+        models: list[str] = []
+        try:
+            # Use a dedicated short-lived session so model discovery does not
+            # interfere with the request session/mocks used by generate().
+            async with aiohttp.ClientSession() as discovery_session:
+                async with discovery_session.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        raw_models = data.get("publisherModels") or data.get("models") or []
+                        for item in raw_models:
+                            if isinstance(item, str):
+                                model_id = item.rsplit("/models/", 1)[-1]
+                                models.append(model_id)
+                                continue
+                            if not isinstance(item, dict):
+                                continue
+                            name = item.get("name", "")
+                            model_id = item.get("model", "") or item.get("modelId", "")
+                            if not model_id and "/models/" in name:
+                                model_id = name.rsplit("/models/", 1)[-1]
+                            if model_id:
+                                models.append(model_id)
+        except Exception:
+            pass
+
+        self._google_models_cache = sorted(set(models))
+        return self._google_models_cache
+
+    async def _select_google_model_for_tier(self, tier: str) -> str:
+        """Select best available Gemini model for the requested tier."""
+        available = await self._load_google_models()
+
+        if available:
+            if tier == "strong":
+                candidates = [
+                    m for m in available
+                    if m.startswith("gemini-") and "pro" in m and "preview" not in m
+                ]
+                if not candidates:
+                    candidates = [m for m in available if m.startswith("gemini-") and "pro" in m]
+            elif tier == "light":
+                candidates = [
+                    m for m in available
+                    if m.startswith("gemini-") and ("flash-lite" in m or "lite" in m)
+                ]
+            else:
+                candidates = [
+                    m for m in available
+                    if m.startswith("gemini-") and "flash" in m and "lite" not in m
+                ]
+
+            if candidates:
+                candidates.sort(key=_extract_version_score, reverse=True)
+                return candidates[0]
+
+        return FALLBACK_GEMINI_MODELS[tier]
+
     def _resolve_model(self, request: CloudLLMRequest) -> CloudLLMRequest:
-        """Map OpenAI models to Vertex AI equivalents transparently."""
-        if request.provider == "openai" and request.model in OPENAI_TO_VERTEX_MAP:
-            mapped = OPENAI_TO_VERTEX_MAP[request.model]
+        """Map non-native providers to a Gemini tier placeholder.
+
+        Anthropic and Google are natively supported on Vertex and are left as-is.
+        Other providers (OpenAI/OpenRouter/etc.) are mapped by capability tier.
+        """
+        if request.provider in ("google", "anthropic"):
+            return request
+
+        tier = _classify_openai_tier(request.model)
+        return CloudLLMRequest(
+            prompt=request.prompt,
+            model=f"__auto_tier__:{tier}",
+            provider="google",
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            response_schema=request.response_schema,
+        )
+
+    @staticmethod
+    def _extract_anthropic_version_hint(error_text: str) -> str | None:
+        """Extract a newer anthropic_version from API error text, if present."""
+        versions = re.findall(r"vertex-\d{4}-\d{2}-\d{2}", error_text)
+        return versions[-1] if versions else None
+
+    async def generate(self, request: CloudLLMRequest) -> CloudLLMResponse:
+        original_provider = request.provider
+        original_model = request.model
+        request = self._resolve_model(request)
+        is_anthropic = request.provider == "anthropic"
+
+        if request.provider == "google" and request.model.startswith("__auto_tier__:"):
+            tier = request.model.split(":", 1)[1]
+            mapped_model = await self._select_google_model_for_tier(tier)
             logger.info(
-                f"Cloud model mapping: {request.provider}/{request.model} → google/{mapped}"
+                f"Cloud model mapping: {original_provider}/{original_model} -> "
+                f"google/{mapped_model} (tier: {tier})"
             )
-            return CloudLLMRequest(
+            request = CloudLLMRequest(
                 prompt=request.prompt,
-                model=mapped,
+                model=mapped_model,
                 provider="google",
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
                 top_p=request.top_p,
                 response_schema=request.response_schema,
             )
-        return request
-
-    async def generate(self, request: CloudLLMRequest) -> CloudLLMResponse:
-        request = self._resolve_model(request)
-        is_anthropic = request.provider == "anthropic"
 
         if is_anthropic:
-            url, payload = self._build_anthropic_request(request)
+            url, payload = self._build_anthropic_request(request, self._anthropic_version)
         else:
             url, payload = self._build_google_request(request)
 
@@ -220,6 +393,25 @@ class VertexLLM(CloudLLM):
         async with self._session.post(url, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
+                if is_anthropic:
+                    hinted = self._extract_anthropic_version_hint(error_text)
+                    if hinted and hinted != self._anthropic_version:
+                        self._anthropic_version = hinted
+                        retry_url, retry_payload = self._build_anthropic_request(
+                            request, self._anthropic_version
+                        )
+                        async with self._session.post(
+                            retry_url, json=retry_payload, headers=headers
+                        ) as retry_response:
+                            if retry_response.status == 200:
+                                data = await retry_response.json()
+                                return self._parse_anthropic_response(data, request.model)
+                            error_text = await retry_response.text()
+                            self._handle_api_error(retry_response.status, error_text)
+                            raise RuntimeError(
+                                f"Vertex AI error ({retry_response.status}): {error_text}"
+                            )
+
                 self._handle_api_error(response.status, error_text)
                 raise RuntimeError(f"Vertex AI error ({response.status}): {error_text}")
 

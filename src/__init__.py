@@ -27,11 +27,8 @@ def get_cloud_llm(region: str = "") -> CloudLLM:
 
 
 def _detect_region() -> str:
-    """Auto-detect GCP region from Cloud Run metadata or fall back to default."""
-    import os, urllib.request
-    region = os.environ.get("CLOUD_RUN_REGION", "")
-    if region:
-        return region
+    """Auto-detect GCP region from Cloud Run metadata server."""
+    import urllib.request
     try:
         req = urllib.request.Request(
             "http://metadata.google.internal/computeMetadata/v1/instance/region",
