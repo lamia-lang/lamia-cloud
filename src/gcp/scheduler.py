@@ -90,6 +90,12 @@ class GCPCloudScheduler(CloudScheduler):
                 http_method=scheduler_v1.HttpMethod.POST,
                 headers={"Content-Type": "application/json"},
                 body=body,
+                oidc_token=scheduler_v1.OidcToken(
+                    service_account_email=(
+                        f"lamia-runner@{self.project_id}.iam.gserviceaccount.com"
+                    ),
+                    audience=target_url,
+                ),
             ),
         )
 

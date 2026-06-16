@@ -30,7 +30,9 @@ def _service_name(schedule_id: str) -> str:
 
 
 def _image_name(project_id: str, schedule_id: str) -> str:
-    return f"gcr.io/{project_id}/lamia-{schedule_id}"
+    import time
+    ts = int(time.time())
+    return f"gcr.io/{project_id}/lamia-{schedule_id}:{ts}"
 
 
 def _collect_project_files(project_root: Path) -> list[Path]:
@@ -78,6 +80,8 @@ def package_deployment(
         reqs = ""
     if "lamia-lang" not in reqs:
         reqs = "lamia-lang\n" + reqs
+    if "google-auth" not in reqs:
+        reqs += "google-auth\n"
     requirements.write_text(reqs)
 
     return staging
@@ -191,23 +195,21 @@ def deploy_cloud_run(
         ingress=run_v2.IngressTraffic.INGRESS_TRAFFIC_INTERNAL_ONLY,
     )
 
+    from google.api_core.exceptions import NotFound
+
+    service.name = full_name
+
     try:
-        operation = client.update_service(
+        operation = client.update_service(service=service)
+        result = operation.result(timeout=300)
+    except NotFound:
+        service.name = ""
+        operation = client.create_service(
+            parent=parent,
             service=service,
-            request={"service": service, "name": full_name},
+            service_id=service_name,
         )
         result = operation.result(timeout=300)
-    except Exception as e:
-        if "NOT_FOUND" in str(e):
-            service.name = full_name
-            operation = client.create_service(
-                parent=parent,
-                service=service,
-                service_id=service_name,
-            )
-            result = operation.result(timeout=300)
-        else:
-            raise
 
     url = result.uri
     logger.info(f"Cloud Run deployed: {url}")
@@ -218,10 +220,15 @@ def deploy_cloud_run(
 
 
 def _ensure_service_account(project_id: str) -> str:
-    """Create lamia-runner service account with Vertex AI access if it doesn't exist."""
+    """Create lamia-runner service account with required permissions.
+
+    Grants:
+    - roles/aiplatform.user — Vertex AI model access
+    - Cloud Scheduler agent gets token creator on lamia-runner (for OIDC signing)
+    """
     from google.cloud import iam_admin_v1
     from google.cloud import resourcemanager_v3
-    from google.iam.v1 import iam_policy_pb2, policy_pb2
+    from google.iam.v1 import policy_pb2
 
     sa_email = f"lamia-runner@{project_id}.iam.gserviceaccount.com"
     iam_client = iam_admin_v1.IAMClient()
@@ -247,21 +254,30 @@ def _ensure_service_account(project_id: str) -> str:
     resource = f"projects/{project_id}"
     policy = rm_client.get_iam_policy(request={"resource": resource})
 
-    vertex_role = "roles/aiplatform.user"
+    project_number = _get_project_number(project_id)
+    scheduler_sa = f"service-{project_number}@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
     member = f"serviceAccount:{sa_email}"
 
-    already_granted = False
-    for binding in policy.bindings:
-        if binding.role == vertex_role and member in binding.members:
-            already_granted = True
-            break
+    required_bindings = {
+        "roles/aiplatform.user": [member],
+        "roles/iam.serviceAccountTokenCreator": [f"serviceAccount:{scheduler_sa}"],
+    }
 
-    if not already_granted:
-        policy.bindings.append(
-            policy_pb2.Binding(role=vertex_role, members=[member])
-        )
+    changed = False
+    for role, members in required_bindings.items():
+        for m in members:
+            already = any(
+                b.role == role and m in b.members for b in policy.bindings
+            )
+            if not already:
+                policy.bindings.append(
+                    policy_pb2.Binding(role=role, members=[m])
+                )
+                logger.info(f"Granted {role} to {m}")
+                changed = True
+
+    if changed:
         rm_client.set_iam_policy(request={"resource": resource, "policy": policy})
-        logger.info(f"Granted {vertex_role} to {sa_email}")
 
     return sa_email
 
