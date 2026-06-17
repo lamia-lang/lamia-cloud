@@ -184,6 +184,18 @@ class GCPCloudScheduler(CloudScheduler):
         except Exception:
             return CloudJobStatus.UNKNOWN
 
+    def pause(self, job: CloudScheduleJob) -> None:
+        """Pause the Cloud Scheduler job (stops triggering)."""
+        client = self._scheduler_client()
+        client.pause_job(name=self._job_name(job))
+        logger.info(f"Paused cloud schedule: {job.script}")
+
+    def resume(self, job: CloudScheduleJob) -> None:
+        """Resume a paused Cloud Scheduler job."""
+        client = self._scheduler_client()
+        client.resume_job(name=self._job_name(job))
+        logger.info(f"Resumed cloud schedule: {job.script}")
+
     def get_installed_config(self, job: CloudScheduleJob) -> Optional[dict]:
         client = self._scheduler_client()
         try:

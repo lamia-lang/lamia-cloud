@@ -1,6 +1,7 @@
 """Cloud Run HTTP handler for lamia scheduled script execution.
 
 Receives POST from Cloud Scheduler, runs the .lm script, returns status.
+Logs stdout/stderr to Cloud Logging for observability.
 """
 
 import json
@@ -23,7 +24,16 @@ class Handler(BaseHTTPRequestHandler):
             cwd="/app/project",
         )
 
+        if result.stdout:
+            print(result.stdout[-3000:], flush=True)
+        if result.stderr:
+            print(result.stderr[-3000:], file=sys.stderr, flush=True)
+
         status = 200 if result.returncode == 0 else 500
+        if status == 500:
+            print(f"[lamia] FAILED (exit={result.returncode}): {SCRIPT_NAME}",
+                  file=sys.stderr, flush=True)
+
         body = json.dumps({
             "exit_code": result.returncode,
             "stdout": result.stdout[-2000:] if result.stdout else "",

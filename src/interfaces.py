@@ -62,3 +62,13 @@ class CloudScheduler(ABC):
     def get_installed_config(self, job: CloudScheduleJob) -> Optional[dict]:
         """Return the currently installed config, or None if not installed."""
         ...
+
+    @abstractmethod
+    def pause(self, job: CloudScheduleJob) -> None:
+        """Pause a scheduled job (stops triggering without removing it)."""
+        ...
+
+    @abstractmethod
+    def resume(self, job: CloudScheduleJob) -> None:
+        """Resume a previously paused job."""
+        ...
