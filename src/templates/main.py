@@ -18,7 +18,7 @@ PORT = int(os.environ.get("PORT", "8080"))
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         result = subprocess.run(
-            [sys.executable, "-m", "lamia", "--file", SCRIPT_NAME],
+            ["lamia", SCRIPT_NAME, "--verbose"],
             capture_output=True,
             text=True,
             cwd="/app/project",
