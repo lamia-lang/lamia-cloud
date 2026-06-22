@@ -211,3 +211,53 @@ class GCPCloudScheduler(CloudScheduler):
             }
         except Exception:
             return None
+
+    def run_once(self, job: CloudScheduleJob, verbose: bool = False) -> dict:
+        """Deploy and invoke once without scheduling."""
+        service_url = deploy(
+            project_id=self.project_id,
+            location=self.location,
+            project_root=job.project_root,
+            script_name=job.script,
+            schedule_id=job.schedule_id,
+        )
+
+        import urllib.request
+        import google.auth.transport.requests
+        from google.oauth2 import id_token
+
+        request = google.auth.transport.requests.Request()
+        token = id_token.fetch_id_token(request, service_url)
+
+        payload = json.dumps({"verbose": verbose}).encode()
+        req = urllib.request.Request(
+            service_url,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        try:
+            resp = urllib.request.urlopen(req, timeout=600)
+            result = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode() if e.fp else ""
+            try:
+                result = json.loads(body)
+            except (json.JSONDecodeError, ValueError):
+                result = {"exit_code": 1, "stderr": f"Cloud Run error ({e.code}): {body[:2000]}"}
+
+        import urllib.parse
+        service_name = f"lamia-{job.schedule_id}"
+        query = (
+            f'resource.type="cloud_run_revision" '
+            f'resource.labels.service_name="{service_name}"'
+        )
+        result["logs_url"] = (
+            f"https://console.cloud.google.com/logs/query;"
+            f"query={urllib.parse.quote(query)}?project={self.project_id}"
+        )
+        return result

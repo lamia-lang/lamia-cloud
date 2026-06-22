@@ -72,3 +72,8 @@ class CloudScheduler(ABC):
     def resume(self, job: CloudScheduleJob) -> None:
         """Resume a previously paused job."""
         ...
+
+    @abstractmethod
+    def run_once(self, job: CloudScheduleJob, verbose: bool = False) -> dict:
+        """Deploy and invoke once without scheduling. Returns {exit_code, stdout, stderr, logs_url}."""
+        ...

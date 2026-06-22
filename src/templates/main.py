@@ -1,7 +1,7 @@
-"""Cloud Run HTTP handler for lamia scheduled script execution.
+"""Cloud Run HTTP handler for lamia script execution.
 
-Receives POST from Cloud Scheduler, runs the .lm script, returns status.
-Logs stdout/stderr to Cloud Logging for observability.
+Receives POST from Cloud Scheduler or `lamia --remote`, runs the .lm script,
+returns status. Logs stdout/stderr to Cloud Logging automatically.
 """
 
 import json
@@ -17,8 +17,19 @@ PORT = int(os.environ.get("PORT", "8080"))
 
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length else b""
+        try:
+            payload = json.loads(body) if body else {}
+        except (json.JSONDecodeError, ValueError):
+            payload = {}
+
+        cmd = ["lamia", SCRIPT_NAME]
+        if payload.get("verbose"):
+            cmd.append("--verbose")
+
         result = subprocess.run(
-            ["lamia", SCRIPT_NAME, "--verbose"],
+            cmd,
             capture_output=True,
             text=True,
             cwd="/app/project",
@@ -34,7 +45,7 @@ class Handler(BaseHTTPRequestHandler):
             print(f"[lamia] FAILED (exit={result.returncode}): {SCRIPT_NAME}",
                   file=sys.stderr, flush=True)
 
-        body = json.dumps({
+        response = json.dumps({
             "exit_code": result.returncode,
             "stdout": result.stdout[-2000:] if result.stdout else "",
             "stderr": result.stderr[-2000:] if result.stderr else "",
@@ -43,7 +54,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(body.encode())
+        self.wfile.write(response.encode())
 
     def log_message(self, format, *args):
         print(format % args, flush=True)
