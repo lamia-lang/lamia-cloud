@@ -15,7 +15,6 @@ class TestPackageDeployment:
         staging = package_deployment(tmp_path, "hello.lm", "abc123")
 
         assert (staging / "Dockerfile").exists()
-        assert (staging / "main.py").exists()
         assert (staging / "requirements.txt").exists()
         assert (staging / "project" / "hello.lm").exists()
 
@@ -78,5 +77,4 @@ class TestCreateSourceTarball:
         with tarfile.open(fileobj=buf, mode="r:gz") as tar:
             names = tar.getnames()
             assert "Dockerfile" in names
-            assert "main.py" in names
             assert "requirements.txt" in names

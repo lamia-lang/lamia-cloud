@@ -1,14 +1,13 @@
-"""Deploys a lamia project to Cloud Run via Cloud Build.
+"""Deploys a lamia project to Cloud Run as a Job via Cloud Build.
 
 Flow:
 1. Package the .lm script + project files into a staging directory
-2. Add Dockerfile + main.py handler + requirements.txt
+2. Add Dockerfile + requirements.txt
 3. Upload to GCS as source tarball
 4. Submit Cloud Build to build the container
-5. Deploy the container to Cloud Run (with Vertex AI IAM for LLM access)
-6. Return the Cloud Run service URL
+5. Deploy the container as a Cloud Run Job (with Vertex AI IAM for LLM access)
 
-LLM authentication uses Vertex AI — the Cloud Run service account gets
+LLM authentication uses Vertex AI — the Cloud Run Job service account gets
 roles/aiplatform.user, so no API keys are needed at runtime.
 """
 
@@ -17,15 +16,15 @@ import logging
 import shutil
 import tarfile
 import tempfile
+import urllib.parse
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# templates/ lives at the lamia_cloud package root, one level above this gcp/ subpackage
 TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 
 
-def _service_name(schedule_id: str) -> str:
+def _job_name(schedule_id: str) -> str:
     return f"lamia-{schedule_id}"
 
 
@@ -39,8 +38,7 @@ def _collect_project_files(project_root: Path) -> list[Path]:
     """Collect .lm files, config.yaml, and supporting Python files from the project.
 
     SECURITY: .env files are explicitly excluded — secrets must never be baked
-    into Docker image layers. API keys are injected via Cloud Run env vars at
-    deploy time (see deploy_cloud_run).
+    into Docker image layers.
     """
     files = []
     for pattern in ("*.lm", "*.py", "*.yaml", "*.yml", "*.json", "*.txt", "*.csv"):
@@ -58,7 +56,7 @@ def package_deployment(
     script_name: str,
     schedule_id: str,
 ) -> Path:
-    """Create a staging directory with everything needed for the Cloud Build."""
+    """Create a staging directory with everything needed for Cloud Build."""
     staging = Path(tempfile.mkdtemp(prefix="lamia-deploy-"))
 
     project_dest = staging / "project"
@@ -70,7 +68,6 @@ def package_deployment(
         shutil.copy2(f, dest)
 
     shutil.copy2(TEMPLATES_DIR / "Dockerfile", staging / "Dockerfile")
-    shutil.copy2(TEMPLATES_DIR / "main.py", staging / "main.py")
 
     requirements = staging / "requirements.txt"
     project_requirements = project_root / "requirements.txt"
@@ -141,7 +138,7 @@ def submit_build(
     )
 
     operation = client.create_build(project_id=project_id, build=build)
-    logger.info(f"Cloud Build submitted, waiting for completion...")
+    logger.info("Cloud Build submitted, waiting for completion...")
     result = operation.result(timeout=600)
 
     if result.status != cloudbuild_v1.Build.Status.SUCCESS:
@@ -152,71 +149,156 @@ def submit_build(
     logger.info(f"Cloud Build succeeded: {image_name}")
 
 
-def deploy_cloud_run(
+def deploy_job(
     project_id: str,
     location: str,
-    service_name: str,
+    job_name: str,
     image_name: str,
     script_name: str,
-) -> str:
-    """Deploy (or update) a Cloud Run service. Returns the service URL.
+    memory: str = "512Mi",
+    cpu: str = "1",
+) -> None:
+    """Deploy (or update) a Cloud Run Job.
 
-    LLM auth is handled by Vertex AI — the service account gets
-    roles/aiplatform.user so no API keys are injected.
+    The job runs the lamia CLI directly — no HTTP handler.
     """
     from google.cloud import run_v2
+    from google.api_core.exceptions import NotFound
 
-    client = run_v2.ServicesClient()
+    client = run_v2.JobsClient()
     parent = f"projects/{project_id}/locations/{location}"
-    full_name = f"{parent}/services/{service_name}"
+    full_name = f"{parent}/jobs/{job_name}"
 
     service_account = _ensure_service_account(project_id)
 
-    env_vars = [
-        run_v2.EnvVar(name="LAMIA_SCRIPT", value=script_name),
-        run_v2.EnvVar(name="GOOGLE_CLOUD_PROJECT", value=project_id),
-    ]
-
     container = run_v2.Container(
         image=image_name,
-        env=env_vars,
+        env=[
+            run_v2.EnvVar(name="LAMIA_SCRIPT", value=script_name),
+            run_v2.EnvVar(name="GOOGLE_CLOUD_PROJECT", value=project_id),
+        ],
         resources=run_v2.ResourceRequirements(
-            limits={"memory": "512Mi", "cpu": "1"},
+            limits={"memory": memory, "cpu": cpu},
         ),
     )
 
-    service = run_v2.Service(
-        template=run_v2.RevisionTemplate(
-            containers=[container],
-            service_account=service_account,
-            max_instance_request_concurrency=1,
-            timeout={"seconds": 540},
+    job = run_v2.Job(
+        template=run_v2.ExecutionTemplate(
+            template=run_v2.TaskTemplate(
+                containers=[container],
+                service_account=service_account,
+                max_retries=0,
+                timeout={"seconds": 3600},
+            ),
         ),
-        ingress=run_v2.IngressTraffic.INGRESS_TRAFFIC_INTERNAL_ONLY,
+        labels={"lamia-managed": "true"},
     )
-
-    from google.api_core.exceptions import NotFound
-
-    service.name = full_name
 
     try:
-        operation = client.update_service(service=service)
-        result = operation.result(timeout=300)
+        job.name = full_name
+        operation = client.update_job(job=job)
+        operation.result(timeout=300)
+        logger.info(f"Updated Cloud Run Job: {job_name}")
     except NotFound:
-        service.name = ""
-        operation = client.create_service(
-            parent=parent,
-            service=service,
-            service_id=service_name,
+        job.name = ""
+        operation = client.create_job(parent=parent, job=job, job_id=job_name)
+        operation.result(timeout=300)
+        logger.info(f"Created Cloud Run Job: {job_name}")
+
+    _allow_scheduler_job_invocation(project_id, location, job_name)
+
+
+def run_job(
+    project_id: str,
+    location: str,
+    job_name: str,
+    verbose: bool = False,
+) -> dict:
+    """Execute a Cloud Run Job and wait for completion.
+
+    Returns dict with exit_code, logs_url, and elapsed_seconds.
+    """
+    from google.cloud import run_v2
+
+    client = run_v2.JobsClient()
+    name = f"projects/{project_id}/locations/{location}/jobs/{job_name}"
+
+    overrides = None
+    if verbose:
+        overrides = run_v2.RunJobRequest.Overrides(
+            container_overrides=[
+                run_v2.RunJobRequest.Overrides.ContainerOverride(
+                    env=[run_v2.EnvVar(name="LAMIA_EXTRA_ARGS", value="--verbose")]
+                )
+            ]
         )
-        result = operation.result(timeout=300)
 
-    url = result.uri
-    logger.info(f"Cloud Run deployed: {url}")
+    request = run_v2.RunJobRequest(name=name)
+    if overrides:
+        request.overrides = overrides
 
-    _allow_scheduler_invocation(project_id, location, service_name)
+    operation = client.run_job(request=request)
+    execution = operation.result()
 
-    return url
+    exit_code = 0 if execution.succeeded_count > 0 else 1
+    elapsed = 0.0
+    if execution.completion_time and execution.start_time:
+        elapsed = (execution.completion_time - execution.start_time).total_seconds()
+
+    logs_url = _cloud_logging_url(project_id, job_name, execution.name)
+
+    return {
+        "exit_code": exit_code,
+        "elapsed_seconds": elapsed,
+        "logs_url": logs_url,
+        "execution_name": execution.name,
+    }
+
+
+def _cloud_logging_url(project_id: str, job_name: str, execution_name: str) -> str:
+    """Build a Cloud Logging URL filtered to this job execution."""
+    execution_id = execution_name.rsplit("/", 1)[-1] if "/" in execution_name else execution_name
+    query = (
+        f'resource.type="cloud_run_job" '
+        f'resource.labels.job_name="{job_name}" '
+        f'labels."run.googleapis.com/execution_name"="{execution_id}"'
+    )
+    return (
+        f"https://console.cloud.google.com/logs/query;"
+        f"query={urllib.parse.quote(query)}?project={project_id}"
+    )
+
+
+def fetch_execution_logs(
+    project_id: str,
+    job_name: str,
+    execution_name: str,
+) -> tuple[str, str]:
+    """Fetch stdout and stderr from Cloud Logging for a completed execution.
+
+    Returns (stdout, stderr) as strings.
+    """
+    from google.cloud import logging as cloud_logging
+
+    client = cloud_logging.Client(project=project_id)
+
+    execution_id = execution_name.rsplit("/", 1)[-1] if "/" in execution_name else execution_name
+    filter_str = (
+        f'resource.type="cloud_run_job" '
+        f'resource.labels.job_name="{job_name}" '
+        f'labels."run.googleapis.com/execution_name"="{execution_id}"'
+    )
+
+    stdout_lines = []
+    stderr_lines = []
+    for entry in client.list_entries(filter_=filter_str, order_by="timestamp asc"):
+        text = entry.payload if isinstance(entry.payload, str) else str(entry.payload)
+        if entry.severity and entry.severity.upper() in ("ERROR", "CRITICAL", "WARNING"):
+            stderr_lines.append(text)
+        else:
+            stdout_lines.append(text)
+
+    return "\n".join(stdout_lines), "\n".join(stderr_lines)
 
 
 def _ensure_service_account(project_id: str) -> str:
@@ -224,7 +306,7 @@ def _ensure_service_account(project_id: str) -> str:
 
     Grants:
     - roles/aiplatform.user — Vertex AI model access
-    - Cloud Scheduler agent gets token creator on lamia-runner (for OIDC signing)
+    - roles/run.developer — allows Cloud Scheduler to run jobs
     """
     from google.cloud import iam_admin_v1
     from google.cloud import resourcemanager_v3
@@ -261,6 +343,7 @@ def _ensure_service_account(project_id: str) -> str:
     required_bindings = {
         "roles/aiplatform.user": [member],
         "roles/iam.serviceAccountTokenCreator": [f"serviceAccount:{scheduler_sa}"],
+        "roles/run.developer": [f"serviceAccount:{scheduler_sa}"],
     }
 
     changed = False
@@ -282,13 +365,13 @@ def _ensure_service_account(project_id: str) -> str:
     return sa_email
 
 
-def _allow_scheduler_invocation(project_id: str, location: str, service_name: str) -> None:
-    """Grant Cloud Scheduler permission to invoke the Cloud Run service."""
+def _allow_scheduler_job_invocation(project_id: str, location: str, job_name: str) -> None:
+    """Grant Cloud Scheduler permission to invoke the Cloud Run Job."""
     from google.cloud import run_v2
-    from google.iam.v1 import iam_policy_pb2, policy_pb2
+    from google.iam.v1 import policy_pb2
 
-    client = run_v2.ServicesClient()
-    resource = f"projects/{project_id}/locations/{location}/services/{service_name}"
+    client = run_v2.JobsClient()
+    resource = f"projects/{project_id}/locations/{location}/jobs/{job_name}"
 
     try:
         policy = client.get_iam_policy(request={"resource": resource})
@@ -325,8 +408,8 @@ def deploy(
     script_name: str,
     schedule_id: str,
 ) -> str:
-    """Full deploy pipeline. Returns the Cloud Run service URL."""
-    service_name = _service_name(schedule_id)
+    """Full deploy pipeline. Returns the job name."""
+    job_name = _job_name(schedule_id)
     image = _image_name(project_id, schedule_id)
 
     logger.info(f"Packaging {script_name} for deployment...")
@@ -342,25 +425,28 @@ def deploy(
         logger.info("Submitting Cloud Build...")
         submit_build(project_id, source_uri, image)
 
-        logger.info("Deploying to Cloud Run with Vertex AI access...")
-        url = deploy_cloud_run(project_id, location, service_name, image, script_name)
+        logger.info("Deploying Cloud Run Job...")
+        deploy_job(project_id, location, job_name, image, script_name)
 
-        return url
+        return job_name
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
 
 def teardown(project_id: str, location: str, schedule_id: str) -> None:
-    """Remove the Cloud Run service for a schedule."""
+    """Remove the Cloud Run Job for a schedule."""
     from google.cloud import run_v2
+    from google.api_core.exceptions import NotFound
 
-    client = run_v2.ServicesClient()
-    service_name = _service_name(schedule_id)
-    full_name = f"projects/{project_id}/locations/{location}/services/{service_name}"
+    client = run_v2.JobsClient()
+    job_name = _job_name(schedule_id)
+    full_name = f"projects/{project_id}/locations/{location}/jobs/{job_name}"
 
     try:
-        client.delete_service(name=full_name)
-        logger.info(f"Deleted Cloud Run service: {service_name}")
+        client.delete_job(name=full_name)
+        logger.info(f"Deleted Cloud Run Job: {job_name}")
+    except NotFound:
+        pass
     except Exception as e:
         if "NOT_FOUND" not in str(e):
             raise

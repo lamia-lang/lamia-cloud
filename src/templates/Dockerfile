@@ -5,9 +5,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY project/ ./project/
 
-ENV PORT=8080
-EXPOSE 8080
-
-CMD ["python", "/app/main.py"]
+CMD ["sh", "-c", "cd /app/project && lamia ${LAMIA_SCRIPT} ${LAMIA_EXTRA_ARGS:-}"]

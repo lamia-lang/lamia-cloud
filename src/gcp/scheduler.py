@@ -1,7 +1,7 @@
-"""GCP Cloud Scheduler backend.
+"""GCP Cloud Scheduler backend using Cloud Run Jobs.
 
-Orchestrates: Cloud Build -> Cloud Run -> Cloud Scheduler.
-The user only provides project_id and location. Everything else is automated.
+Orchestrates: Cloud Build -> Cloud Run Job -> Cloud Scheduler.
+Cloud Scheduler triggers jobs via the Cloud Run Admin API (POST jobs/:run).
 """
 
 import json
@@ -11,17 +11,13 @@ from typing import Optional
 
 from lamia_cloud.interfaces import CloudScheduler
 from lamia_cloud.types import CloudScheduleJob, CloudJobStatus
-from lamia_cloud.gcp.deployer import deploy, teardown
+from lamia_cloud.gcp.deployer import deploy, teardown, run_job, fetch_execution_logs, _job_name
 
 logger = logging.getLogger(__name__)
 
 
 def _enable_apis(project_id: str) -> None:
-    """Enable all required GCP APIs automatically.
-
-    Service Usage API must be enabled first (bootstraps the rest).
-    Most GCP projects have it enabled by default.
-    """
+    """Enable all required GCP APIs automatically."""
     try:
         from google.cloud import service_usage_v1
         client = service_usage_v1.ServiceUsageClient()
@@ -33,6 +29,7 @@ def _enable_apis(project_id: str) -> None:
             "storage.googleapis.com",
             "aiplatform.googleapis.com",
             "iam.googleapis.com",
+            "logging.googleapis.com",
         ]
         for api in apis:
             service_name = f"projects/{project_id}/services/{api}"
@@ -51,7 +48,7 @@ def _enable_apis(project_id: str) -> None:
 
 
 class GCPCloudScheduler(CloudScheduler):
-    """GCP Cloud Scheduler backend with automatic deployment."""
+    """GCP Cloud Scheduler backend with Cloud Run Jobs."""
 
     def __init__(self, *, project_id: str, location: str):
         self.project_id = project_id
@@ -78,44 +75,46 @@ class GCPCloudScheduler(CloudScheduler):
         from google.cloud import scheduler_v1
         return scheduler_v1.CloudSchedulerClient()
 
-    def _job_name(self, job: CloudScheduleJob) -> str:
+    def _scheduler_job_name(self, job: CloudScheduleJob) -> str:
         return f"{self._parent}/jobs/lamia-{job.schedule_id}"
 
-    def _build_scheduler_job(self, job: CloudScheduleJob, target_url: str):
+    def _build_scheduler_job(self, job: CloudScheduleJob, cr_job_name: str):
+        """Build a Cloud Scheduler job that triggers a Cloud Run Job via the Run API."""
         from google.cloud import scheduler_v1
 
         schedule = job.cron
         if schedule == "@reboot":
             schedule = "0 * * * *"
 
-        body = json.dumps({
-            "schedule_id": job.schedule_id,
-            "script": job.script,
-        }).encode()
+        run_job_url = (
+            f"https://{self.location}-run.googleapis.com/v2/"
+            f"projects/{self.project_id}/locations/{self.location}/"
+            f"jobs/{cr_job_name}:run"
+        )
+
+        sa_email = f"lamia-runner@{self.project_id}.iam.gserviceaccount.com"
 
         return scheduler_v1.Job(
-            name=self._job_name(job),
+            name=self._scheduler_job_name(job),
             schedule=schedule,
             time_zone="UTC",
             http_target=scheduler_v1.HttpTarget(
-                uri=target_url,
+                uri=run_job_url,
                 http_method=scheduler_v1.HttpMethod.POST,
                 headers={"Content-Type": "application/json"},
-                body=body,
-                oidc_token=scheduler_v1.OidcToken(
-                    service_account_email=(
-                        f"lamia-runner@{self.project_id}.iam.gserviceaccount.com"
-                    ),
-                    audience=target_url,
+                body=b"{}",
+                oauth_token=scheduler_v1.OAuthToken(
+                    service_account_email=sa_email,
+                    scope="https://www.googleapis.com/auth/cloud-platform",
                 ),
             ),
         )
 
     def install(self, job: CloudScheduleJob, lamia_bin: str) -> None:
-        """Deploy the script to Cloud Run and create a Cloud Scheduler trigger."""
+        """Deploy the script as a Cloud Run Job and create a Cloud Scheduler trigger."""
         logger.info(f"Deploying {job.script} to cloud...")
 
-        service_url = deploy(
+        cr_job_name = deploy(
             project_id=self.project_id,
             location=self.location,
             project_root=job.project_root,
@@ -124,7 +123,7 @@ class GCPCloudScheduler(CloudScheduler):
         )
 
         client = self._scheduler_client()
-        scheduler_job = self._build_scheduler_job(job, service_url)
+        scheduler_job = self._build_scheduler_job(job, cr_job_name)
 
         from google.api_core.exceptions import AlreadyExists, NotFound
 
@@ -143,17 +142,17 @@ class GCPCloudScheduler(CloudScheduler):
                         f"Cloud Scheduler location '{self.location}' not ready after retries. "
                         f"The API may still be propagating — wait a minute and retry."
                     )
-                logger.info(f"Cloud Scheduler not ready yet, retrying in 15s...")
+                logger.info("Cloud Scheduler not ready yet, retrying in 15s...")
                 time.sleep(15)
 
     def uninstall(self, job: CloudScheduleJob) -> None:
-        """Remove both the Cloud Scheduler job and the Cloud Run service."""
+        """Remove both the Cloud Scheduler job and the Cloud Run Job."""
         client = self._scheduler_client()
         from google.api_core.exceptions import Aborted, NotFound
 
         for attempt in range(5):
             try:
-                client.delete_job(name=self._job_name(job))
+                client.delete_job(name=self._scheduler_job_name(job))
                 logger.info(f"Deleted cloud schedule: {job.script}")
                 break
             except NotFound:
@@ -168,7 +167,7 @@ class GCPCloudScheduler(CloudScheduler):
     def is_installed(self, job: CloudScheduleJob) -> bool:
         client = self._scheduler_client()
         try:
-            client.get_job(name=self._job_name(job))
+            client.get_job(name=self._scheduler_job_name(job))
             return True
         except Exception:
             return False
@@ -176,7 +175,7 @@ class GCPCloudScheduler(CloudScheduler):
     def get_status(self, job: CloudScheduleJob) -> CloudJobStatus:
         client = self._scheduler_client()
         try:
-            cloud_job = client.get_job(name=self._job_name(job))
+            cloud_job = client.get_job(name=self._scheduler_job_name(job))
             from google.cloud.scheduler_v1 import Job
             if cloud_job.state == Job.State.ENABLED:
                 return CloudJobStatus.ACTIVE
@@ -187,19 +186,19 @@ class GCPCloudScheduler(CloudScheduler):
     def pause(self, job: CloudScheduleJob) -> None:
         """Pause the Cloud Scheduler job (stops triggering)."""
         client = self._scheduler_client()
-        client.pause_job(name=self._job_name(job))
+        client.pause_job(name=self._scheduler_job_name(job))
         logger.info(f"Paused cloud schedule: {job.script}")
 
     def resume(self, job: CloudScheduleJob) -> None:
         """Resume a paused Cloud Scheduler job."""
         client = self._scheduler_client()
-        client.resume_job(name=self._job_name(job))
+        client.resume_job(name=self._scheduler_job_name(job))
         logger.info(f"Resumed cloud schedule: {job.script}")
 
     def get_installed_config(self, job: CloudScheduleJob) -> Optional[dict]:
         client = self._scheduler_client()
         try:
-            cloud_job = client.get_job(name=self._job_name(job))
+            cloud_job = client.get_job(name=self._scheduler_job_name(job))
             return {
                 "schedule": cloud_job.schedule,
                 "state": cloud_job.state.name,
@@ -214,7 +213,7 @@ class GCPCloudScheduler(CloudScheduler):
 
     def run_once(self, job: CloudScheduleJob, verbose: bool = False) -> dict:
         """Deploy and invoke once without scheduling."""
-        service_url = deploy(
+        cr_job_name = deploy(
             project_id=self.project_id,
             location=self.location,
             project_root=job.project_root,
@@ -222,42 +221,19 @@ class GCPCloudScheduler(CloudScheduler):
             schedule_id=job.schedule_id,
         )
 
-        import urllib.request
-        import google.auth.transport.requests
-        from google.oauth2 import id_token
-
-        request = google.auth.transport.requests.Request()
-        token = id_token.fetch_id_token(request, service_url)
-
-        payload = json.dumps({"verbose": verbose}).encode()
-        req = urllib.request.Request(
-            service_url,
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
+        result = run_job(
+            project_id=self.project_id,
+            location=self.location,
+            job_name=cr_job_name,
+            verbose=verbose,
         )
 
-        try:
-            resp = urllib.request.urlopen(req, timeout=600)
-            result = json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            body = e.read().decode() if e.fp else ""
-            try:
-                result = json.loads(body)
-            except (json.JSONDecodeError, ValueError):
-                result = {"exit_code": 1, "stderr": f"Cloud Run error ({e.code}): {body[:2000]}"}
+        stdout, stderr = fetch_execution_logs(
+            project_id=self.project_id,
+            job_name=cr_job_name,
+            execution_name=result.get("execution_name", ""),
+        )
+        result["stdout"] = stdout
+        result["stderr"] = stderr
 
-        import urllib.parse
-        service_name = f"lamia-{job.schedule_id}"
-        query = (
-            f'resource.type="cloud_run_revision" '
-            f'resource.labels.service_name="{service_name}"'
-        )
-        result["logs_url"] = (
-            f"https://console.cloud.google.com/logs/query;"
-            f"query={urllib.parse.quote(query)}?project={self.project_id}"
-        )
         return result
