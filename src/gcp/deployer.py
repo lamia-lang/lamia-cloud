@@ -24,17 +24,17 @@ logger = logging.getLogger(__name__)
 TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 
 
-def _job_name(schedule_id: str) -> str:
-    return f"lamia-{schedule_id}"
+def deployment_name(name: str) -> str:
+    return f"lamia-{name}"
 
 
-def _image_name(project_id: str, schedule_id: str) -> str:
+def _image_name(project_id: str, name: str) -> str:
     import time
     ts = int(time.time())
-    return f"gcr.io/{project_id}/lamia-{schedule_id}:{ts}"
+    return f"gcr.io/{project_id}/lamia-{name}:{ts}"
 
 
-def _collect_project_files(project_root: Path) -> list[Path]:
+def collect_project_files(project_root: Path) -> list[Path]:
     """Collect .lm files, config.yaml, and supporting Python files from the project.
 
     SECURITY: .env files are explicitly excluded — secrets must never be baked
@@ -54,14 +54,14 @@ def _collect_project_files(project_root: Path) -> list[Path]:
 def package_deployment(
     project_root: Path,
     script_name: str,
-    schedule_id: str,
+    name: str,
 ) -> Path:
     """Create a staging directory with everything needed for Cloud Build."""
     staging = Path(tempfile.mkdtemp(prefix="lamia-deploy-"))
 
     project_dest = staging / "project"
     project_dest.mkdir()
-    for f in _collect_project_files(project_root):
+    for f in collect_project_files(project_root):
         rel = f.relative_to(project_root)
         dest = project_dest / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -93,12 +93,12 @@ def create_source_tarball(staging_dir: Path) -> bytes:
     return buf.getvalue()
 
 
-def upload_source(project_id: str, tarball: bytes, schedule_id: str) -> str:
+def upload_source(project_id: str, tarball: bytes, name: str) -> str:
     """Upload source tarball to GCS and return the gs:// URI."""
     from google.cloud import storage
 
     bucket_name = f"{project_id}_cloudbuild"
-    blob_name = f"lamia-source/{schedule_id}.tar.gz"
+    blob_name = f"lamia-source/{name}.tar.gz"
 
     client = storage.Client(project=project_id)
     bucket = client.bucket(bucket_name)
@@ -211,17 +211,17 @@ def deploy_job(
 def run_job(
     project_id: str,
     location: str,
-    job_name: str,
+    target: str,
     verbose: bool = False,
 ) -> dict:
-    """Execute a Cloud Run Job and wait for completion.
+    """Execute the remote target and wait for completion.
 
     Returns dict with exit_code, logs_url, and elapsed_seconds.
     """
     from google.cloud import run_v2
 
     client = run_v2.JobsClient()
-    name = f"projects/{project_id}/locations/{location}/jobs/{job_name}"
+    name = f"projects/{project_id}/locations/{location}/jobs/{target}"
 
     overrides = None
     if verbose:
@@ -245,7 +245,7 @@ def run_job(
     if execution.completion_time and execution.start_time:
         elapsed = (execution.completion_time - execution.start_time).total_seconds()
 
-    logs_url = _cloud_logging_url(project_id, job_name, execution.name)
+    logs_url = _cloud_logging_url(project_id, target, execution.name)
 
     return {
         "exit_code": exit_code,
@@ -255,12 +255,12 @@ def run_job(
     }
 
 
-def _cloud_logging_url(project_id: str, job_name: str, execution_name: str) -> str:
-    """Build a Cloud Logging URL filtered to this job execution."""
+def _cloud_logging_url(project_id: str, target: str, execution_name: str) -> str:
+    """Build a Cloud Logging URL filtered to this execution."""
     execution_id = execution_name.rsplit("/", 1)[-1] if "/" in execution_name else execution_name
     query = (
         f'resource.type="cloud_run_job" '
-        f'resource.labels.job_name="{job_name}" '
+        f'resource.labels.job_name="{target}" '
         f'labels."run.googleapis.com/execution_name"="{execution_id}"'
     )
     return (
@@ -271,7 +271,7 @@ def _cloud_logging_url(project_id: str, job_name: str, execution_name: str) -> s
 
 def fetch_execution_logs(
     project_id: str,
-    job_name: str,
+    target: str,
     execution_name: str,
 ) -> tuple[str, str]:
     """Fetch stdout and stderr from Cloud Logging for a completed execution.
@@ -285,7 +285,7 @@ def fetch_execution_logs(
     execution_id = execution_name.rsplit("/", 1)[-1] if "/" in execution_name else execution_name
     filter_str = (
         f'resource.type="cloud_run_job" '
-        f'resource.labels.job_name="{job_name}" '
+        f'resource.labels.job_name="{target}" '
         f'labels."run.googleapis.com/execution_name"="{execution_id}"'
     )
 
@@ -406,21 +406,21 @@ def deploy(
     location: str,
     project_root: Path,
     script_name: str,
-    schedule_id: str,
+    name: str,
 ) -> str:
-    """Full deploy pipeline. Returns the job name."""
-    job_name = _job_name(schedule_id)
-    image = _image_name(project_id, schedule_id)
+    """Full deploy pipeline. Returns the deployment name."""
+    job_name = deployment_name(name)
+    image = _image_name(project_id, name)
 
     logger.info(f"Packaging {script_name} for deployment...")
-    staging = package_deployment(project_root, script_name, schedule_id)
+    staging = package_deployment(project_root, script_name, name)
 
     try:
         logger.info("Creating source tarball...")
         tarball = create_source_tarball(staging)
 
         logger.info("Uploading source to GCS...")
-        source_uri = upload_source(project_id, tarball, schedule_id)
+        source_uri = upload_source(project_id, tarball, name)
 
         logger.info("Submitting Cloud Build...")
         submit_build(project_id, source_uri, image)
@@ -433,13 +433,13 @@ def deploy(
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def teardown(project_id: str, location: str, schedule_id: str) -> None:
-    """Remove the Cloud Run Job for a schedule."""
+def teardown(project_id: str, location: str, name: str) -> None:
+    """Remove the deployed Cloud Run resource."""
     from google.cloud import run_v2
     from google.api_core.exceptions import NotFound
 
     client = run_v2.JobsClient()
-    job_name = _job_name(schedule_id)
+    job_name = deployment_name(name)
     full_name = f"projects/{project_id}/locations/{location}/jobs/{job_name}"
 
     try:

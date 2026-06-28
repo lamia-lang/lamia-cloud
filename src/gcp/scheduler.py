@@ -11,7 +11,7 @@ from typing import Optional
 
 from lamia_cloud.interfaces import CloudScheduler
 from lamia_cloud.types import CloudScheduleJob, CloudJobStatus
-from lamia_cloud.gcp.deployer import deploy, teardown, run_job, fetch_execution_logs, _job_name
+from lamia_cloud.gcp.deployer import deploy, teardown, run_job, fetch_execution_logs
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +119,7 @@ class GCPCloudScheduler(CloudScheduler):
             location=self.location,
             project_root=job.project_root,
             script_name=job.script,
-            schedule_id=job.schedule_id,
+            name=job.schedule_id,
         )
 
         client = self._scheduler_client()
@@ -218,19 +218,19 @@ class GCPCloudScheduler(CloudScheduler):
             location=self.location,
             project_root=job.project_root,
             script_name=job.script,
-            schedule_id=job.schedule_id,
+            name=job.schedule_id,
         )
 
         result = run_job(
             project_id=self.project_id,
             location=self.location,
-            job_name=cr_job_name,
+            target=cr_job_name,
             verbose=verbose,
         )
 
         stdout, stderr = fetch_execution_logs(
             project_id=self.project_id,
-            job_name=cr_job_name,
+            target=cr_job_name,
             execution_name=result.get("execution_name", ""),
         )
         result["stdout"] = stdout
