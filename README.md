@@ -1,6 +1,8 @@
 # lamia-cloud
 
-Cloud scheduling backend for [Lamia](https://github.com/lamia-lang/lamia). Deploy `.lm` scripts to run on a schedule in the cloud — fully automated. Currently supports GCP.
+Cloud execution backend for [Lamia](https://github.com/lamia-lang/lamia). Run `.lm` scripts once with `--remote`, deploy scheduled cloud jobs, and prepare for upcoming cloud trigger support. Currently supports GCP.
+
+For common agent use cases, you usually do not need to build custom cloud-agent infrastructure from scratch before shipping with Lamia.
 
 ## Installation
 
@@ -26,7 +28,15 @@ cloud:
   location: us-central1  # optional, default: us-central1
 ```
 
-2. Schedule your script with the `--remote` flag:
+2. Run a script once in the cloud with `--remote`:
+
+```bash
+lamia my_script.lm --remote
+```
+
+Use this one-shot run to validate cloud execution, permissions, and logs before adding a schedule.
+
+3. Schedule your script with the `--remote` flag:
 
 ```bash
 lamia schedule add my_script.lm --every day --remote
@@ -44,10 +54,11 @@ lamia schedule remove <id>       # tears down cloud resources and removes the jo
 
 ## How It Works
 
-1. `lamia schedule add --remote` packages your project and deploys it as a Cloud Run service
-2. Cloud Scheduler triggers it on your cron schedule
-3. Logs are available in Cloud Logging
-4. `lamia schedule list` fetches live execution status from the cloud
+1. `lamia <script>.lm --remote` packages your project and runs it as a Cloud Run Job (one-shot)
+2. `lamia schedule add <script>.lm --remote` deploys the same cloud job with Cloud Scheduler
+3. Cloud Scheduler triggers the job on your cron schedule
+4. Logs are available in Cloud Logging
+5. `lamia schedule list` fetches live execution status from the cloud
 
 ## LLM on Cloud — Vertex AI
 

@@ -16,12 +16,150 @@ import logging
 import shutil
 import tarfile
 import tempfile
+import time
 import urllib.parse
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Optional
+
+from google.api_core.exceptions import NotFound
+from google.cloud import iam_admin_v1, logging as cloud_logging, resourcemanager_v3, run_v2, storage
+from google.cloud.devtools import cloudbuild_v1
+from google.iam.v1 import policy_pb2
+
+from lamia_cloud.contracts import SCRIPT_CAPABILITY_FIELDS, SOURCE_HASH_LABEL
 
 logger = logging.getLogger(__name__)
 
 TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
+
+# GCP Cloud Run Job enforces minimum CPU for memory tiers:
+#   1 vCPU: up to 4Gi
+#   2 vCPU: up to 8Gi
+#   4 vCPU: up to 16Gi
+#   8 vCPU: up to 32Gi
+_MEMORY_ORDER = ["512Mi", "1Gi", "2Gi", "4Gi", "8Gi", "16Gi", "32Gi"]
+
+
+def compute_resource_tier(
+    uses_llm: bool = False,
+    uses_browser: bool = False,
+    uses_files: bool = False,
+    uses_file_context: bool = False,
+) -> tuple[str, str]:
+    """Compute (memory, cpu) for a Cloud Run Job based on script capabilities.
+
+    GCP-specific: respects Cloud Run's CPU/memory coupling rules.
+
+    Lamia scripts execute sequentially — LLM, browser, and file operations
+    never run concurrently within a single container. Memory is allocated for
+    the peak consumer (browser > LLM > files), not the sum.
+    """
+    memory_mib = 512
+
+    if uses_files or uses_file_context:
+        memory_mib = max(memory_mib, 1024)
+    if uses_llm:
+        memory_mib = max(memory_mib, 1024)
+    if uses_browser:
+        memory_mib = max(memory_mib, 4096)
+
+    if memory_mib <= 512:
+        return ("512Mi", "1")
+    elif memory_mib <= 1024:
+        return ("1Gi", "1")
+    elif memory_mib <= 2048:
+        return ("2Gi", "1")
+    elif memory_mib <= 4096:
+        return ("4Gi", "2")
+    elif memory_mib <= 8192:
+        return ("8Gi", "2")
+    elif memory_mib <= 16384:
+        return ("16Gi", "4")
+    else:
+        return ("32Gi", "8")
+
+
+def _get_existing_resources(
+    project_id: str, location: str, job_name: str
+) -> Optional[tuple[str, str]]:
+    """Read current memory/cpu from an existing Cloud Run Job.
+
+    Returns (memory, cpu) or None if the job doesn't exist.
+    """
+    try:
+        client = run_v2.JobsClient()
+        name = f"projects/{project_id}/locations/{location}/jobs/{job_name}"
+        job = client.get_job(request={"name": name})
+        containers = job.template.template.containers
+        if containers:
+            limits = containers[0].resources.limits or {}
+            return (limits.get("memory", "512Mi"), limits.get("cpu", "1"))
+    except Exception:
+        pass
+    return None
+
+
+def _memory_to_mib(mem: str) -> int:
+    """Convert memory string like '4Gi' or '512Mi' to MiB integer."""
+    mem = mem.strip()
+    if mem.endswith("Gi"):
+        return int(float(mem[:-2]) * 1024)
+    if mem.endswith("Mi"):
+        return int(float(mem[:-2]))
+    if mem.endswith("G"):
+        return int(float(mem[:-1]) * 1024)
+    if mem.endswith("M"):
+        return int(float(mem[:-1]))
+    return 512
+
+
+def _extract_capability_flags(capabilities) -> dict[str, bool]:
+    """Extract and validate capability flags from metadata object.
+
+    This is an explicit contract boundary between lamia core (AST analyzer)
+    and cloud providers. If fields are renamed on either side, deployment
+    fails fast with a clear error.
+    """
+    if not isinstance(capabilities, Mapping):
+        raise ValueError("Invalid script capability payload: expected dict-like mapping.")
+
+    missing = [field for field in SCRIPT_CAPABILITY_FIELDS if field not in capabilities]
+    if missing:
+        missing_csv = ", ".join(sorted(missing))
+        raise ValueError(
+            "Invalid script capability payload: missing fields "
+            f"[{missing_csv}]. If you changed capability field names, update BOTH "
+            "the producer capability payload schema and "
+            "lamia_cloud.contracts.SCRIPT_CAPABILITY_FIELDS."
+        )
+
+    return {field: bool(capabilities[field]) for field in SCRIPT_CAPABILITY_FIELDS}
+
+
+def get_deployed_source_hash(project_id: str, location: str, target: str) -> Optional[str]:
+    """Read source hash label from deployed Cloud Run Job."""
+    try:
+        client = run_v2.JobsClient()
+        resource = f"projects/{project_id}/locations/{location}/jobs/{target}"
+        job = client.get_job(request={"name": resource})
+        return (job.labels or {}).get(SOURCE_HASH_LABEL)
+    except Exception:
+        return None
+
+
+def set_deployed_source_hash(project_id: str, location: str, target: str, hash_val: str) -> None:
+    """Set source hash label on deployed Cloud Run Job."""
+    try:
+        client = run_v2.JobsClient()
+        resource = f"projects/{project_id}/locations/{location}/jobs/{target}"
+        job = client.get_job(request={"name": resource})
+        if job.labels is None:
+            job.labels = {}
+        job.labels[SOURCE_HASH_LABEL] = hash_val
+        client.update_job(job=job)
+    except Exception:
+        pass
 
 
 def deployment_name(name: str) -> str:
@@ -29,7 +167,6 @@ def deployment_name(name: str) -> str:
 
 
 def _image_name(project_id: str, name: str) -> str:
-    import time
     ts = int(time.time())
     return f"gcr.io/{project_id}/lamia-{name}:{ts}"
 
@@ -95,8 +232,6 @@ def create_source_tarball(staging_dir: Path) -> bytes:
 
 def upload_source(project_id: str, tarball: bytes, name: str) -> str:
     """Upload source tarball to GCS and return the gs:// URI."""
-    from google.cloud import storage
-
     bucket_name = f"{project_id}_cloudbuild"
     blob_name = f"lamia-source/{name}.tar.gz"
 
@@ -117,8 +252,6 @@ def submit_build(
     image_name: str,
 ) -> None:
     """Submit a Cloud Build to build the container image."""
-    from google.cloud.devtools import cloudbuild_v1
-
     client = cloudbuild_v1.CloudBuildClient()
 
     build = cloudbuild_v1.Build(
@@ -162,9 +295,6 @@ def deploy_job(
 
     The job runs the lamia CLI directly — no HTTP handler.
     """
-    from google.cloud import run_v2
-    from google.api_core.exceptions import NotFound
-
     client = run_v2.JobsClient()
     parent = f"projects/{project_id}/locations/{location}"
     full_name = f"{parent}/jobs/{job_name}"
@@ -218,8 +348,6 @@ def run_job(
 
     Returns dict with exit_code, logs_url, and elapsed_seconds.
     """
-    from google.cloud import run_v2
-
     client = run_v2.JobsClient()
     name = f"projects/{project_id}/locations/{location}/jobs/{target}"
 
@@ -278,8 +406,6 @@ def fetch_execution_logs(
 
     Returns (stdout, stderr) as strings.
     """
-    from google.cloud import logging as cloud_logging
-
     client = cloud_logging.Client(project=project_id)
 
     execution_id = execution_name.rsplit("/", 1)[-1] if "/" in execution_name else execution_name
@@ -308,10 +434,6 @@ def _ensure_service_account(project_id: str) -> str:
     - roles/aiplatform.user — Vertex AI model access
     - roles/run.developer — allows Cloud Scheduler to run jobs
     """
-    from google.cloud import iam_admin_v1
-    from google.cloud import resourcemanager_v3
-    from google.iam.v1 import policy_pb2
-
     sa_email = f"lamia-runner@{project_id}.iam.gserviceaccount.com"
     iam_client = iam_admin_v1.IAMClient()
 
@@ -367,9 +489,6 @@ def _ensure_service_account(project_id: str) -> str:
 
 def _allow_scheduler_job_invocation(project_id: str, location: str, job_name: str) -> None:
     """Grant Cloud Scheduler permission to invoke the Cloud Run Job."""
-    from google.cloud import run_v2
-    from google.iam.v1 import policy_pb2
-
     client = run_v2.JobsClient()
     resource = f"projects/{project_id}/locations/{location}/jobs/{job_name}"
 
@@ -394,8 +513,6 @@ def _allow_scheduler_job_invocation(project_id: str, location: str, job_name: st
 
 def _get_project_number(project_id: str) -> str:
     """Get the project number from project ID."""
-    from google.cloud import resourcemanager_v3
-
     client = resourcemanager_v3.ProjectsClient()
     project = client.get_project(name=f"projects/{project_id}")
     return project.name.split("/")[1]
@@ -407,10 +524,34 @@ def deploy(
     project_root: Path,
     script_name: str,
     name: str,
+    capabilities=None,
 ) -> str:
-    """Full deploy pipeline. Returns the deployment name."""
+    """Full deploy pipeline. Returns the deployment name.
+
+    If capabilities (ScriptCapabilities dataclass) is provided, resource tier
+    is computed from it. If the job already exists with a higher tier (e.g.
+    elevated by a previous OOM recovery), the higher tier is preserved.
+    """
     job_name = deployment_name(name)
     image = _image_name(project_id, name)
+
+    if capabilities is not None:
+        flags = _extract_capability_flags(capabilities)
+        memory, cpu = compute_resource_tier(
+            uses_llm=flags["uses_llm"],
+            uses_browser=flags["uses_browser"],
+            uses_files=flags["uses_files"],
+            uses_file_context=flags["uses_file_context"],
+        )
+    else:
+        memory, cpu = ("1Gi", "1")
+
+    existing = _get_existing_resources(project_id, location, job_name)
+    if existing:
+        existing_mib = _memory_to_mib(existing[0])
+        computed_mib = _memory_to_mib(memory)
+        if existing_mib > computed_mib:
+            memory, cpu = existing
 
     logger.info(f"Packaging {script_name} for deployment...")
     staging = package_deployment(project_root, script_name, name)
@@ -425,8 +566,8 @@ def deploy(
         logger.info("Submitting Cloud Build...")
         submit_build(project_id, source_uri, image)
 
-        logger.info("Deploying Cloud Run Job...")
-        deploy_job(project_id, location, job_name, image, script_name)
+        logger.info(f"Deploying Cloud Run Job ({memory}, {cpu} vCPU)...")
+        deploy_job(project_id, location, job_name, image, script_name, memory=memory, cpu=cpu)
 
         return job_name
     finally:
@@ -435,9 +576,6 @@ def deploy(
 
 def teardown(project_id: str, location: str, name: str) -> None:
     """Remove the deployed Cloud Run resource."""
-    from google.cloud import run_v2
-    from google.api_core.exceptions import NotFound
-
     client = run_v2.JobsClient()
     job_name = deployment_name(name)
     full_name = f"projects/{project_id}/locations/{location}/jobs/{job_name}"

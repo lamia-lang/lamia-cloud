@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lamia-cloud"
 dynamic = ["version"]
-description = "Cloud scheduling backend for Lamia — deploy and run .lm scripts on GCP."
+description = "Cloud execution backend for Lamia: run once with --remote, schedule jobs, and with cloud triggers."
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
-keywords = ["lamia", "cloud", "scheduler", "gcp", "automation"]
+keywords = ["lamia", "llm", "agentic automation", "cloud scheduler", "gcp", "serverless", "workflow automation", "python automation"]
 authors = [
     {name = "Sergey Sargsyan"}
 ]
