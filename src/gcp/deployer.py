@@ -28,17 +28,12 @@ from google.cloud.devtools import cloudbuild_v1
 from google.iam.v1 import policy_pb2
 
 from lamia_cloud.contracts import SCRIPT_CAPABILITY_FIELDS, SOURCE_HASH_LABEL
+from lamia_cloud.file_sync import file_sha256
 
 logger = logging.getLogger(__name__)
 
 TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
-
-# GCP Cloud Run Job enforces minimum CPU for memory tiers:
-#   1 vCPU: up to 4Gi
-#   2 vCPU: up to 8Gi
-#   4 vCPU: up to 16Gi
-#   8 vCPU: up to 32Gi
-_MEMORY_ORDER = ["512Mi", "1Gi", "2Gi", "4Gi", "8Gi", "16Gi", "32Gi"]
+FILES_MOUNT_PATH = "/mnt/lamia-files"
 
 
 def compute_resource_tier(
@@ -192,6 +187,7 @@ def package_deployment(
     project_root: Path,
     script_name: str,
     name: str,
+    uses_files: bool = False,
 ) -> Path:
     """Create a staging directory with everything needed for Cloud Build."""
     staging = Path(tempfile.mkdtemp(prefix="lamia-deploy-"))
@@ -204,7 +200,13 @@ def package_deployment(
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(f, dest)
 
-    shutil.copy2(TEMPLATES_DIR / "Dockerfile", staging / "Dockerfile")
+    dockerfile_dest = staging / "Dockerfile"
+    dockerfile_content = (TEMPLATES_DIR / "Dockerfile").read_text()
+    if uses_files:
+        cmd = f'CMD ["sh", "-c", "cd {FILES_MOUNT_PATH} && lamia /app/project/${{LAMIA_SCRIPT}} ${{LAMIA_EXTRA_ARGS:-}}"]'
+    else:
+        cmd = 'CMD ["sh", "-c", "cd /app/project && lamia ${LAMIA_SCRIPT} ${LAMIA_EXTRA_ARGS:-}"]'
+    dockerfile_dest.write_text(dockerfile_content + cmd + "\n")
 
     requirements = staging / "requirements.txt"
     project_requirements = project_root / "requirements.txt"
@@ -244,6 +246,74 @@ def upload_source(project_id: str, tarball: bytes, name: str) -> str:
     blob.upload_from_string(tarball, content_type="application/gzip")
 
     return f"gs://{bucket_name}/{blob_name}"
+
+
+def ensure_files_bucket(project_id: str, location: str) -> str:
+    """Ensure filesystem bucket exists (bucket name == project_id)."""
+    bucket_name = project_id
+    client = storage.Client(project=project_id)
+    bucket = client.bucket(bucket_name)
+    if not bucket.exists():
+        bucket = client.create_bucket(bucket_name, location=location)
+        logger.info(f"Created files bucket: {bucket_name}")
+    return bucket_name
+
+
+def sync_files_to_bucket(
+    project_id: str,
+    bucket_name: str,
+    entries: list,
+) -> dict:
+    """Incrementally sync planned files to GCS and report overwrites."""
+    client = storage.Client(project=project_id)
+    bucket = client.bucket(bucket_name)
+
+    uploaded = 0
+    skipped = 0
+    overwrite_warnings: list[str] = []
+    total = len(entries)
+
+    for i, entry in enumerate(entries, 1):
+        local_path = entry.resolved_path
+        key = entry.bucket_key
+        local_sha = file_sha256(local_path)
+
+        blob = bucket.blob(key)
+        if blob.exists():
+            blob.reload()
+            if (blob.metadata or {}).get("lamia-sha256") == local_sha:
+                skipped += 1
+                logger.info(f"  [{i}/{total}] Skipped (unchanged): {key}")
+                continue
+            overwrite_warnings.append(f"Remote file will be updated: gs://{bucket_name}/{key}")
+
+        logger.info(f"  [{i}/{total}] Uploading: {key}")
+        blob.metadata = {"lamia-sha256": local_sha}
+        blob.upload_from_filename(local_path)
+        uploaded += 1
+        logger.info(f"  [{i}/{total}] Uploaded: {key}")
+
+    return {
+        "uploaded": uploaded,
+        "skipped": skipped,
+        "overwrite_warnings": overwrite_warnings,
+    }
+
+
+def sync_runtime_files(
+    project_id: str,
+    location: str,
+    entries: list,
+) -> dict:
+    """Sync runtime file references for a remote invocation."""
+    if not entries:
+        return {"uploaded": 0, "skipped": 0, "overwrite_warnings": []}
+    files_bucket = ensure_files_bucket(project_id, location)
+    return sync_files_to_bucket(
+        project_id=project_id,
+        bucket_name=files_bucket,
+        entries=entries,
+    )
 
 
 def submit_build(
@@ -290,6 +360,7 @@ def deploy_job(
     script_name: str,
     memory: str = "512Mi",
     cpu: str = "1",
+    files_bucket: Optional[str] = None,
 ) -> None:
     """Deploy (or update) a Cloud Run Job.
 
@@ -312,10 +383,29 @@ def deploy_job(
         ),
     )
 
+    volumes = []
+    if files_bucket:
+        container.volume_mounts = [
+            run_v2.VolumeMount(
+                name="lamia-files",
+                mount_path=FILES_MOUNT_PATH,
+            )
+        ]
+        volumes = [
+            run_v2.Volume(
+                name="lamia-files",
+                gcs=run_v2.GCSVolumeSource(
+                    bucket=files_bucket,
+                    read_only=False,
+                ),
+            )
+        ]
+
     job = run_v2.Job(
         template=run_v2.ExecutionTemplate(
             template=run_v2.TaskTemplate(
                 containers=[container],
+                volumes=volumes,
                 service_account=service_account,
                 max_retries=0,
                 timeout={"seconds": 3600},
@@ -525,6 +615,7 @@ def deploy(
     script_name: str,
     name: str,
     capabilities=None,
+    uses_files: bool = False,
 ) -> str:
     """Full deploy pipeline. Returns the deployment name.
 
@@ -554,7 +645,12 @@ def deploy(
             memory, cpu = existing
 
     logger.info(f"Packaging {script_name} for deployment...")
-    staging = package_deployment(project_root, script_name, name)
+    staging = package_deployment(
+        project_root,
+        script_name,
+        name,
+        uses_files=uses_files,
+    )
 
     try:
         logger.info("Creating source tarball...")
@@ -566,8 +662,21 @@ def deploy(
         logger.info("Submitting Cloud Build...")
         submit_build(project_id, source_uri, image)
 
+        files_bucket = None
+        if uses_files:
+            files_bucket = ensure_files_bucket(project_id, location)
+
         logger.info(f"Deploying Cloud Run Job ({memory}, {cpu} vCPU)...")
-        deploy_job(project_id, location, job_name, image, script_name, memory=memory, cpu=cpu)
+        deploy_job(
+            project_id,
+            location,
+            job_name,
+            image,
+            script_name,
+            memory=memory,
+            cpu=cpu,
+            files_bucket=files_bucket,
+        )
 
         return job_name
     finally:

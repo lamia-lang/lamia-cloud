@@ -6,11 +6,14 @@ from pathlib import Path
 
 import pytest
 
+import lamia_cloud.gcp.deployer as deployer_module
+from lamia_cloud.contracts import FileSyncEntry
 from lamia_cloud.gcp.deployer import (
     _extract_capability_flags,
     compute_resource_tier,
     create_source_tarball,
     package_deployment,
+    sync_files_to_bucket,
 )
 
 
@@ -69,6 +72,22 @@ class TestPackageDeployment:
         assert not (project / ".env").exists()
         assert (project / "hello.lm").exists()
         assert (project / "config.yaml").exists()
+
+    def test_dockerfile_default_cmd_no_files(self, tmp_path):
+        (tmp_path / "hello.lm").write_text('print("hi")')
+
+        staging = package_deployment(tmp_path, "hello.lm", "abc123", uses_files=False)
+        content = (staging / "Dockerfile").read_text()
+        assert "cd /app/project && lamia ${LAMIA_SCRIPT}" in content
+        assert "/mnt/lamia-files" not in content
+
+    def test_dockerfile_cmd_uses_fuse_mount_when_files_used(self, tmp_path):
+        (tmp_path / "hello.lm").write_text('file.read("data.txt")')
+
+        staging = package_deployment(tmp_path, "hello.lm", "abc123", uses_files=True)
+        content = (staging / "Dockerfile").read_text()
+        assert "cd /mnt/lamia-files" in content
+        assert "lamia /app/project/${LAMIA_SCRIPT}" in content
 
 
 class TestCreateSourceTarball:
@@ -142,3 +161,78 @@ class TestCapabilityContract:
             ),
         ):
             _extract_capability_flags(payload)
+
+
+class _FakeBlob:
+    def __init__(self, key, existing):
+        self.key = key
+        self._existing = existing
+        self.metadata = existing.get(key, {}).get("metadata")
+        self._existing_store = existing
+
+    def exists(self):
+        return self.key in self._existing_store
+
+    def reload(self):
+        if self.exists():
+            self.metadata = self._existing_store[self.key]["metadata"]
+
+    def upload_from_filename(self, path):
+        self._existing_store[self.key] = {"metadata": self.metadata, "path": path}
+
+
+class _FakeBucket:
+    def __init__(self, existing):
+        self._existing = existing
+
+    def blob(self, key):
+        return _FakeBlob(key, self._existing)
+
+
+class _FakeStorageClient:
+    def __init__(self, existing):
+        self._existing = existing
+
+    def bucket(self, _bucket_name):
+        return _FakeBucket(self._existing)
+
+
+class TestIncrementalFileSync:
+    def test_sync_uploads_new_files_and_skips_unchanged(self, tmp_path, monkeypatch):
+        local = tmp_path / "data.txt"
+        local.write_text("hello")
+
+        existing = {}
+        monkeypatch.setattr(
+            deployer_module.storage,
+            "Client",
+            lambda project: _FakeStorageClient(existing),
+        )
+
+        plan = [FileSyncEntry(raw_path="data.txt", resolved_path=str(local), bucket_key="data.txt")]
+
+        first = sync_files_to_bucket("proj", "bucket", plan)
+        assert first["uploaded"] == 1
+        assert first["skipped"] == 0
+
+        second = sync_files_to_bucket("proj", "bucket", plan)
+        assert second["uploaded"] == 0
+        assert second["skipped"] == 1
+
+    def test_sync_warns_on_overwrite(self, tmp_path, monkeypatch):
+        local = tmp_path / "data.txt"
+        local.write_text("new-content")
+
+        existing = {
+            "data.txt": {"metadata": {"lamia-sha256": "oldhash"}, "path": "old"}
+        }
+        monkeypatch.setattr(
+            deployer_module.storage,
+            "Client",
+            lambda project: _FakeStorageClient(existing),
+        )
+
+        plan = [FileSyncEntry(raw_path="data.txt", resolved_path=str(local), bucket_key="data.txt")]
+        result = sync_files_to_bucket("proj", "bucket", plan)
+        assert result["uploaded"] == 1
+        assert len(result["overwrite_warnings"]) == 1
