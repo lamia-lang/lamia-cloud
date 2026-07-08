@@ -1,13 +1,19 @@
 """Cloud interfaces — the public API of lamia-cloud.
 
 These abstract base classes are what external consumers (e.g., lamia's cloud
-adapter) implement against. Two separate abstractions: CloudLLM (text
-generation) and CloudScheduler (remote jobs).
+adapter) implement against. Three separate abstractions: CloudLLM (text
+generation), CloudScheduler (remote jobs), and CloudTriggerProvider (event-driven).
 """
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from lamia_cloud.types import CloudLLMRequest, CloudLLMResponse, CloudScheduleJob, CloudJobStatus
+from lamia_cloud.types import (
+    CloudLLMRequest,
+    CloudLLMResponse,
+    CloudScheduleJob,
+    CloudJobStatus,
+    TriggerDeploymentPlan,
+)
 
 
 class CloudLLM(ABC):
@@ -76,4 +82,33 @@ class CloudScheduler(ABC):
     @abstractmethod
     def run_once(self, job: CloudScheduleJob, verbose: bool = False) -> dict:
         """Deploy and invoke once without scheduling. Returns {exit_code, stdout, stderr, logs_url}."""
+        ...
+
+
+class CloudTriggerProvider(ABC):
+    """Abstract cloud trigger provider for event-driven multi-stage execution.
+
+    Orchestrates: event ingress -> orchestration engine -> Cloud Run Job execution.
+    GCP: Eventarc -> Workflows -> Cloud Run Jobs.
+    """
+
+    @classmethod
+    @abstractmethod
+    def from_config(cls, cloud_cfg: dict) -> "CloudTriggerProvider":
+        """Create instance from config.yaml cloud section."""
+        ...
+
+    @abstractmethod
+    def deploy(self, plan: "TriggerDeploymentPlan") -> str:
+        """Deploy all stages + orchestration + event routing. Returns deployment_id."""
+        ...
+
+    @abstractmethod
+    def undeploy(self, name: str) -> None:
+        """Remove all stages, orchestration, and event routing."""
+        ...
+
+    @abstractmethod
+    def list_deployments(self) -> list[dict]:
+        """List deployed triggers with last execution status."""
         ...

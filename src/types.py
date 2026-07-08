@@ -6,7 +6,7 @@ lamia-cloud NEVER imports from the lamia package.
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 
 # ─── LLM types ───────────────────────────────────────────────────────────────
@@ -48,3 +48,23 @@ class CloudScheduleJob:
     schedule_id: str
     catch_up: bool = True
     project_root: Path = field(default_factory=Path)
+
+
+# ─── Trigger types ────────────────────────────────────────────────────────────
+
+@dataclass
+class TriggerStage:
+    """One stage of a triggered script (code between trigger boundaries)."""
+    stage_index: int
+    trigger_method: str
+    trigger_config: dict = field(default_factory=dict)
+    output_bindings: List[str] = field(default_factory=list)
+    script_source: str = ""
+
+
+@dataclass
+class TriggerDeploymentPlan:
+    """Provider-agnostic description of a triggered script deployment."""
+    name: str
+    stages: List[TriggerStage] = field(default_factory=list)
+    capabilities: dict = field(default_factory=dict)
