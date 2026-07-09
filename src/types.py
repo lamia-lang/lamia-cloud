@@ -64,7 +64,14 @@ class TriggerStage:
 
 @dataclass
 class TriggerDeploymentPlan:
-    """Provider-agnostic description of a triggered script deployment."""
+    """Provider-agnostic description of a triggered script deployment.
+
+    mode:
+        "reactive" -- Eventarc directly invokes workflow on each event (always-on).
+        "scheduled" -- Events accumulate in a queue; a scheduler drains them at cron time.
+    """
     name: str
     stages: List[TriggerStage] = field(default_factory=list)
     capabilities: dict = field(default_factory=dict)
+    mode: str = "reactive"
+    cron: Optional[str] = None
