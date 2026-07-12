@@ -8,12 +8,14 @@ Implements CloudTriggerProvider using:
 - Cloud Scheduler for drain activation (scheduled mode)
 """
 
+import json
 import logging
+import time
 from pathlib import Path
 from typing import Optional
 
 from google.api_core.exceptions import AlreadyExists, NotFound
-from google.cloud import eventarc_v1, scheduler_v1, workflows_v1, pubsub_v1
+from google.cloud import eventarc_v1, monitoring_v3, scheduler_v1, workflows_v1, pubsub_v1
 
 from lamia_cloud.interfaces import CloudTriggerProvider
 from lamia_cloud.types import TriggerDeploymentPlan, TriggerStage
@@ -31,6 +33,59 @@ TRIGGER_METHOD_TO_EVENTARC_TYPE = {
     "file_modified": "google.cloud.storage.object.v1.metadataUpdated",
     "email_received": "google.cloud.pubsub.topic.v1.messagePublished",
 }
+
+STORAGE_CONFIG_TO_EVENTARC_ATTR = {
+    "path": "bucket",
+}
+
+PUBSUB_FILTER_ATTRIBUTES = {
+    "to": "recipient",
+    "from_domain": "senderDomain",
+    "subject_contains": "subjectContains",
+    "label": "label",
+}
+
+
+def _build_eventarc_filters(
+    trigger_method: str,
+    trigger_config: dict,
+    event_type: str,
+) -> list:
+    """Build Eventarc event_filters from trigger config kwargs.
+
+    All string kwargs in trigger_config become infrastructure-level filters
+    that prevent the script from launching for non-matching events.
+    """
+    filters = [
+        eventarc_v1.EventFilter(attribute="type", value=event_type),
+    ]
+
+    if "storage" in event_type:
+        for config_key, eventarc_attr in STORAGE_CONFIG_TO_EVENTARC_ATTR.items():
+            value = trigger_config.get(config_key, "")
+            if value:
+                filters.append(
+                    eventarc_v1.EventFilter(attribute=eventarc_attr, value=value)
+                )
+
+    return filters
+
+
+def _build_pubsub_filter_expression(trigger_method: str, trigger_config: dict) -> str:
+    """Build a Pub/Sub subscription filter expression from trigger config kwargs.
+
+    Used for email and other Pub/Sub-routed triggers where Eventarc attribute
+    filtering is insufficient. Multiple filters are AND-combined.
+    """
+    clauses = []
+    attr_map = PUBSUB_FILTER_ATTRIBUTES if trigger_method == "email_received" else {}
+
+    for config_key, pubsub_attr in attr_map.items():
+        value = trigger_config.get(config_key, "")
+        if value:
+            clauses.append(f'attributes.{pubsub_attr} = "{value}"')
+
+    return " AND ".join(clauses)
 
 
 class GCPTriggerProvider(CloudTriggerProvider):
@@ -78,6 +133,7 @@ class GCPTriggerProvider(CloudTriggerProvider):
         self._deploy_workflow(workflow_name, workflow_yaml)
 
         self._create_eventarc_trigger(plan)
+        self._create_dead_letter_topic(plan)
 
         logger.info(f"Trigger deployed (reactive): {plan.name}")
         return workflow_name
@@ -110,6 +166,7 @@ class GCPTriggerProvider(CloudTriggerProvider):
         self._create_eventarc_to_pubsub(plan)
 
         self._create_cloud_scheduler(plan, workflow_name)
+        self._create_dead_letter_topic(plan)
 
         logger.info(f"Trigger deployed (scheduled): {plan.name}")
         return workflow_name
@@ -121,6 +178,7 @@ class GCPTriggerProvider(CloudTriggerProvider):
         self._delete_eventarc_trigger(name)
         self._delete_cloud_scheduler(name)
         self._delete_accumulation_pubsub(name)
+        self._delete_dead_letter_topic(name)
         teardown(self.project_id, self.location, name)
         logger.info(f"Trigger undeployed: {name}")
 
@@ -133,6 +191,7 @@ class GCPTriggerProvider(CloudTriggerProvider):
             for wf in client.list_workflows(parent=parent):
                 if wf.name.split("/")[-1].startswith("lamia-trigger-"):
                     trigger_name = wf.name.split("/")[-1].replace("lamia-trigger-", "")
+                    failed_count = self._get_failed_event_count(trigger_name)
                     deployments.append({
                         "name": trigger_name,
                         "script": f"{trigger_name.replace('-', '_')}.lm",
@@ -140,6 +199,7 @@ class GCPTriggerProvider(CloudTriggerProvider):
                         "mode": (wf.labels or {}).get("trigger-mode", "reactive"),
                         "last_run": (wf.labels or {}).get("last-run", "never"),
                         "last_status": (wf.labels or {}).get("last-status", "unknown"),
+                        "failed_event_count": failed_count,
                     })
         except Exception as e:
             logger.warning(f"Failed to list workflows: {e}")
@@ -197,15 +257,11 @@ class GCPTriggerProvider(CloudTriggerProvider):
         trigger_id = f"lamia-trigger-{plan.name}"
         workflow_name = f"lamia-trigger-{plan.name}"
 
-        event_filters = [
-            eventarc_v1.EventFilter(attribute="type", value=event_type),
-        ]
-
-        bucket = first_stage.trigger_config.get("path", "")
-        if bucket and "storage" in event_type:
-            event_filters.append(
-                eventarc_v1.EventFilter(attribute="bucket", value=bucket)
-            )
+        event_filters = _build_eventarc_filters(
+            first_stage.trigger_method,
+            first_stage.trigger_config,
+            event_type,
+        )
 
         sa_email = f"lamia-runner@{self.project_id}.iam.gserviceaccount.com"
 
@@ -245,15 +301,11 @@ class GCPTriggerProvider(CloudTriggerProvider):
         trigger_id = f"lamia-trigger-{plan.name}"
         topic_name = f"projects/{self.project_id}/topics/lamia-trigger-{plan.name}-events"
 
-        event_filters = [
-            eventarc_v1.EventFilter(attribute="type", value=event_type),
-        ]
-
-        bucket = first_stage.trigger_config.get("path", "")
-        if bucket and "storage" in event_type:
-            event_filters.append(
-                eventarc_v1.EventFilter(attribute="bucket", value=bucket)
-            )
+        event_filters = _build_eventarc_filters(
+            first_stage.trigger_method,
+            first_stage.trigger_config,
+            event_type,
+        )
 
         sa_email = f"lamia-runner@{self.project_id}.iam.gserviceaccount.com"
 
@@ -308,13 +360,24 @@ class GCPTriggerProvider(CloudTriggerProvider):
         except AlreadyExists:
             pass
 
+        first_stage = plan.stages[0]
+        filter_expr = _build_pubsub_filter_expression(
+            first_stage.trigger_method, first_stage.trigger_config
+        )
+
+        sub_kwargs = {
+            "name": sub_path,
+            "topic": topic_path,
+            "ack_deadline_seconds": 600,
+        }
+        if filter_expr:
+            sub_kwargs["filter"] = filter_expr
+
         try:
-            subscriber.create_subscription(
-                name=sub_path,
-                topic=topic_path,
-                ack_deadline_seconds=600,
-            )
+            subscriber.create_subscription(**sub_kwargs)
             logger.info(f"Created accumulation subscription: {topic_id}")
+            if filter_expr:
+                logger.info(f"  filter: {filter_expr}")
         except AlreadyExists:
             pass
 
@@ -335,6 +398,137 @@ class GCPTriggerProvider(CloudTriggerProvider):
             publisher.delete_topic(topic=topic_path)
         except NotFound:
             pass
+
+    def _create_dead_letter_topic(self, plan: TriggerDeploymentPlan) -> None:
+        """Create dead-letter topic + subscription for failed events."""
+        publisher = pubsub_v1.PublisherClient()
+        subscriber = pubsub_v1.SubscriberClient()
+
+        topic_id = f"lamia-trigger-{plan.name}-dead-letter"
+        topic_path = f"projects/{self.project_id}/topics/{topic_id}"
+        sub_path = f"projects/{self.project_id}/subscriptions/{topic_id}"
+
+        try:
+            publisher.create_topic(name=topic_path)
+            logger.info(f"Created dead-letter topic: {topic_id}")
+        except AlreadyExists:
+            pass
+
+        try:
+            subscriber.create_subscription(
+                name=sub_path,
+                topic=topic_path,
+                ack_deadline_seconds=600,
+            )
+            logger.info(f"Created dead-letter subscription: {topic_id}")
+        except AlreadyExists:
+            pass
+
+    def _delete_dead_letter_topic(self, name: str) -> None:
+        """Delete dead-letter topic + subscription."""
+        publisher = pubsub_v1.PublisherClient()
+        subscriber = pubsub_v1.SubscriberClient()
+
+        topic_id = f"lamia-trigger-{name}-dead-letter"
+        topic_path = f"projects/{self.project_id}/topics/{topic_id}"
+        sub_path = f"projects/{self.project_id}/subscriptions/{topic_id}"
+
+        try:
+            subscriber.delete_subscription(subscription=sub_path)
+        except NotFound:
+            pass
+        try:
+            publisher.delete_topic(topic=topic_path)
+        except NotFound:
+            pass
+
+    def get_failed_events(self, name: str) -> list[dict]:
+        """Peek failed events without consuming them."""
+        subscriber = pubsub_v1.SubscriberClient()
+        sub_path = f"projects/{self.project_id}/subscriptions/lamia-trigger-{name}-dead-letter"
+
+        events: list[dict] = []
+        try:
+            response = subscriber.pull(
+                subscription=sub_path,
+                max_messages=100,
+                return_immediately=True,
+            )
+            for msg in response.received_messages:
+                try:
+                    payload = json.loads(msg.message.data.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    payload = {"raw": msg.message.data.decode("utf-8", errors="replace")}
+                events.append({
+                    "payload": payload,
+                    "timestamp": msg.message.publish_time.isoformat(),
+                    "attempt_count": int(msg.message.attributes.get("retry_count", "0")) or None,
+                })
+            if response.received_messages:
+                subscriber.modify_ack_deadline(
+                    subscription=sub_path,
+                    ack_ids=[m.ack_id for m in response.received_messages],
+                    ack_deadline_seconds=0,
+                )
+        except NotFound:
+            pass
+        except Exception as e:
+            logger.warning(f"Failed to peek failed events for {name}: {e}")
+        return events
+
+    def clear_failed_events(self, name: str) -> int:
+        """Acknowledge and remove all failed events. Returns count removed."""
+        subscriber = pubsub_v1.SubscriberClient()
+        sub_path = f"projects/{self.project_id}/subscriptions/lamia-trigger-{name}-dead-letter"
+
+        total = 0
+        try:
+            while True:
+                response = subscriber.pull(
+                    subscription=sub_path,
+                    max_messages=100,
+                    return_immediately=True,
+                )
+                if not response.received_messages:
+                    break
+                ack_ids = [m.ack_id for m in response.received_messages]
+                subscriber.acknowledge(subscription=sub_path, ack_ids=ack_ids)
+                total += len(ack_ids)
+        except NotFound:
+            pass
+        except Exception as e:
+            logger.warning(f"Failed to clear failed events for {name}: {e}")
+        return total
+
+    def _get_failed_event_count(self, name: str) -> int:
+        """Get number of unprocessed failed events (via Cloud Monitoring metric)."""
+        client = monitoring_v3.MetricServiceClient()
+        project_path = f"projects/{self.project_id}"
+        sub_id = f"lamia-trigger-{name}-dead-letter"
+
+        query = (
+            f'resource.type="pubsub_subscription" '
+            f'AND resource.labels.subscription_id="{sub_id}" '
+            f'AND metric.type="pubsub.googleapis.com/subscription/num_undelivered_messages"'
+        )
+
+        now = int(time.time())
+        try:
+            results = client.list_time_series(
+                name=project_path,
+                filter=query,
+                interval=monitoring_v3.TimeInterval(
+                    end_time={"seconds": now},
+                    start_time={"seconds": now - 300},
+                ),
+                view=monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
+            )
+            for ts in results:
+                if ts.points:
+                    return ts.points[0].value.int64_value
+        except Exception:
+            pass
+        return 0
 
     def _create_pubsub_for_continuations(self, plan: TriggerDeploymentPlan) -> None:
         """Create Pub/Sub topics for multi-trigger continuation stages.

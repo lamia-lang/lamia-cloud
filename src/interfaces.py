@@ -5,7 +5,7 @@ adapter) implement against. Three separate abstractions: CloudLLM (text
 generation), CloudScheduler (remote jobs), and CloudTriggerProvider (event-driven).
 """
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import List, Optional
 
 from lamia_cloud.types import (
     CloudLLMRequest,
@@ -110,5 +110,25 @@ class CloudTriggerProvider(ABC):
 
     @abstractmethod
     def list_deployments(self) -> list[dict]:
-        """List deployed triggers with last execution status."""
+        """List deployed triggers with last execution status.
+
+        Each dict must include at minimum:
+            name, script, trigger_method, mode, last_run, last_status,
+            failed_event_count (int)
+        """
+        ...
+
+    @abstractmethod
+    def get_failed_events(self, name: str) -> List[dict]:
+        """Retrieve failed events that could not be processed.
+
+        Returns a list of event payloads (dicts) that exhausted retries.
+        Messages are peeked (not consumed) so they remain available for
+        replay or manual inspection.
+        """
+        ...
+
+    @abstractmethod
+    def clear_failed_events(self, name: str) -> int:
+        """Acknowledge and remove all failed events. Returns count removed."""
         ...

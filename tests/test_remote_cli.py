@@ -1,14 +1,13 @@
 import pytest
 from pathlib import Path
 
-from lamia_cloud.contracts import FileSyncEntry
+from lamia_cloud.contracts import FileSyncEntry, SCRIPT_CAPABILITY_FIELDS
 
 pytest.importorskip("lamia.cli.remote", reason="lamia source not installed (cross-package integration test)")
 
-from lamia.cli.remote import (
+from lamia.cli.remote import _warn_about_file_uploads
+from lamia.cli.script_analysis import (
     ScriptCapabilities,
-    SCRIPT_CAPABILITY_FIELDS,
-    _warn_about_file_uploads,
     analyze_script,
     script_capability_field_names,
 )
@@ -159,8 +158,7 @@ def test_script_capabilities_contract_field_names():
     field_names = script_capability_field_names()
     assert field_names == tuple(SCRIPT_CAPABILITY_FIELDS), (
         "ScriptCapabilities contract changed. If you add/rename/remove fields, "
-        "update BOTH lamia.cli.remote.ScriptCapabilities and "
-        "lamia.cli.remote.SCRIPT_CAPABILITY_FIELDS + the mirrored keys in "
+        "update BOTH lamia.cli.script_analysis.ScriptCapabilities and "
         "lamia_cloud.contracts.SCRIPT_CAPABILITY_FIELDS."
     )
 
