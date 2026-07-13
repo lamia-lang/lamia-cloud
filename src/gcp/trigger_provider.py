@@ -502,7 +502,6 @@ class GCPTriggerProvider(CloudTriggerProvider):
 
     def _get_failed_event_count(self, name: str) -> int:
         """Get number of unprocessed failed events (via Cloud Monitoring metric)."""
-        client = monitoring_v3.MetricServiceClient()
         project_path = f"projects/{self.project_id}"
         sub_id = f"lamia-trigger-{name}-dead-letter"
 
@@ -514,6 +513,7 @@ class GCPTriggerProvider(CloudTriggerProvider):
 
         now = int(time.time())
         try:
+            client = monitoring_v3.MetricServiceClient()
             results = client.list_time_series(
                 name=project_path,
                 filter=query,
