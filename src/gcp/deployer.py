@@ -22,7 +22,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Optional
 
-from google.api_core.exceptions import NotFound
+from google.api_core.exceptions import Aborted, NotFound
 from google.cloud import iam_admin_v1, logging as cloud_logging, resourcemanager_v3, run_v2, storage
 from google.cloud.devtools import cloudbuild_v1
 from google.iam.v1 import policy_pb2
@@ -428,6 +428,48 @@ def deploy_job(
     _allow_scheduler_job_invocation(project_id, location, job_name)
 
 
+def _execution_from_operation(operation) -> Optional[run_v2.Execution]:
+    """Extract Execution metadata from a completed run_job LRO.
+
+    When a container crashes, operation.result() raises Aborted but the LRO
+    metadata still contains the Execution resource with its name and timing.
+    """
+    metadata = operation.metadata
+    if metadata and getattr(metadata, "name", None):
+        return metadata
+
+    op = operation.operation
+    if op.HasField("response"):
+        from google.api_core import protobuf_helpers
+
+        execution = protobuf_helpers.from_any_pb(run_v2.Execution, op.response)
+        if execution.name:
+            return execution
+
+    return None
+
+
+def _result_from_execution(
+    project_id: str,
+    target: str,
+    execution: run_v2.Execution,
+) -> dict:
+    """Build the run_job result dict from an Execution resource."""
+    exit_code = 0 if execution.succeeded_count > 0 else 1
+    elapsed = 0.0
+    if execution.completion_time and execution.start_time:
+        elapsed = (execution.completion_time - execution.start_time).total_seconds()
+
+    logs_url = _cloud_logging_url(project_id, target, execution.name)
+
+    return {
+        "exit_code": exit_code,
+        "elapsed_seconds": elapsed,
+        "logs_url": logs_url,
+        "execution_name": execution.name,
+    }
+
+
 def run_job(
     project_id: str,
     location: str,
@@ -456,21 +498,15 @@ def run_job(
         request.overrides = overrides
 
     operation = client.run_job(request=request)
-    execution = operation.result()
+    try:
+        execution = operation.result()
+    except Aborted:
+        execution = _execution_from_operation(operation)
+        if execution is None:
+            raise
+        return _result_from_execution(project_id, target, execution)
 
-    exit_code = 0 if execution.succeeded_count > 0 else 1
-    elapsed = 0.0
-    if execution.completion_time and execution.start_time:
-        elapsed = (execution.completion_time - execution.start_time).total_seconds()
-
-    logs_url = _cloud_logging_url(project_id, target, execution.name)
-
-    return {
-        "exit_code": exit_code,
-        "elapsed_seconds": elapsed,
-        "logs_url": logs_url,
-        "execution_name": execution.name,
-    }
+    return _result_from_execution(project_id, target, execution)
 
 
 def _cloud_logging_url(project_id: str, target: str, execution_name: str) -> str:
