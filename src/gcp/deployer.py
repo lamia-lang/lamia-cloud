@@ -216,6 +216,8 @@ def package_deployment(
         reqs = ""
     if "lamia-lang" not in reqs:
         reqs = "lamia-lang\n" + reqs
+    if "lamia-cloud" not in reqs:
+        reqs += "lamia-cloud\n"
     if "google-auth" not in reqs:
         reqs += "google-auth\n"
     requirements.write_text(reqs)

@@ -35,6 +35,7 @@ class TestPackageDeployment:
         staging = package_deployment(tmp_path, "hello.lm", "abc123")
         reqs = (staging / "requirements.txt").read_text()
         assert "lamia-lang" in reqs
+        assert "lamia-cloud" in reqs
 
     def test_preserves_existing_requirements(self, tmp_path):
         script = tmp_path / "hello.lm"
@@ -44,6 +45,7 @@ class TestPackageDeployment:
         staging = package_deployment(tmp_path, "hello.lm", "abc123")
         reqs = (staging / "requirements.txt").read_text()
         assert "lamia-lang" in reqs
+        assert "lamia-cloud" in reqs
         assert "requests>=2.0" in reqs
         assert "pandas" in reqs
 
