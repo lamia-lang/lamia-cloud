@@ -80,6 +80,11 @@ class CloudScheduler(ABC):
         ...
 
     @abstractmethod
+    def fetch_logs(self, job: CloudScheduleJob) -> dict:
+        """Fetch logs from the most recent execution. Returns {stdout, stderr, logs_url}."""
+        ...
+
+    @abstractmethod
     def run_once(self, job: CloudScheduleJob, verbose: bool = False) -> dict:
         """Deploy and invoke once without scheduling. Returns {exit_code, stdout, stderr, logs_url}."""
         ...

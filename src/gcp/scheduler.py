@@ -11,7 +11,7 @@ from typing import Optional
 
 from lamia_cloud.interfaces import CloudScheduler
 from lamia_cloud.types import CloudScheduleJob, CloudJobStatus
-from lamia_cloud.gcp.deployer import deploy, teardown, run_job, fetch_execution_logs
+from lamia_cloud.gcp.deployer import deploy, deployment_name, teardown, run_job, fetch_execution_logs, fetch_latest_logs
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +210,19 @@ class GCPCloudScheduler(CloudScheduler):
             }
         except Exception:
             return None
+
+    def fetch_logs(self, job: CloudScheduleJob) -> dict:
+        """Fetch logs from the most recent execution.
+
+        Returns {stdout, stderr, logs_url}.
+        """
+        cr_job_name = deployment_name(job.schedule_id)
+        stdout, stderr, logs_url = fetch_latest_logs(
+            project_id=self.project_id,
+            location=self.location,
+            target=cr_job_name,
+        )
+        return {"stdout": stdout, "stderr": stderr, "logs_url": logs_url}
 
     def run_once(self, job: CloudScheduleJob, verbose: bool = False) -> dict:
         """Deploy and invoke once without scheduling."""

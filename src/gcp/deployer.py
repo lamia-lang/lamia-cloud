@@ -517,6 +517,41 @@ def fetch_execution_logs(
     return "\n".join(stdout_lines), "\n".join(stderr_lines)
 
 
+def _is_execution_completed(execution: run_v2.Execution) -> bool:
+    return execution.completion_time is not None
+
+
+def fetch_latest_logs(
+    project_id: str,
+    location: str,
+    target: str,
+) -> tuple[str, str, str]:
+    """Fetch logs from the most recent completed execution of a Cloud Run Job.
+
+    Returns (stdout, stderr, logs_url). Raises if no executions exist.
+    """
+    client = run_v2.ExecutionsClient()
+    parent = f"projects/{project_id}/locations/{location}/jobs/{target}"
+
+    seen_any = False
+    latest_completed = None
+    for execution in client.list_executions(request={"parent": parent, "page_size": 1}):
+        seen_any = True
+        if _is_execution_completed(execution):
+            latest_completed = execution
+            break
+
+    if not seen_any:
+        raise ValueError(f"No executions found for job {target}")
+    if latest_completed is None:
+        raise ValueError(f"No completed executions found for job {target}")
+
+    logs_url = _cloud_logging_url(project_id, target, latest_completed.name)
+    stdout, stderr = fetch_execution_logs(project_id, target, latest_completed.name)
+    return stdout, stderr, logs_url
+
+
+
 def _ensure_service_account(project_id: str) -> str:
     """Create lamia-runner service account with required permissions.
 
