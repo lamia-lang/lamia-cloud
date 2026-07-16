@@ -30,10 +30,50 @@ from google.iam.v1 import policy_pb2
 from lamia_cloud.contracts import SCRIPT_CAPABILITY_FIELDS, SOURCE_HASH_LABEL
 from lamia_cloud.file_sync import file_sha256
 
+try:
+    from google.cloud import service_usage_v1
+except ImportError:
+    service_usage_v1 = None
+
 logger = logging.getLogger(__name__)
 
 TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 FILES_MOUNT_PATH = "/mnt/lamia-files"
+
+_REQUIRED_GCP_APIS = (
+    "serviceusage.googleapis.com",
+    "cloudscheduler.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "run.googleapis.com",
+    "storage.googleapis.com",
+    "aiplatform.googleapis.com",
+    "iam.googleapis.com",
+    "logging.googleapis.com",
+)
+
+
+def ensure_apis_enabled(project_id: str) -> None:
+    """Enable all required GCP APIs automatically.
+
+    Idempotent and safe to call multiple times. No-op when service_usage_v1
+    is not installed.
+    """
+    if service_usage_v1 is None:
+        return
+
+    client = service_usage_v1.ServiceUsageClient()
+    for api in _REQUIRED_GCP_APIS:
+        service_name = f"projects/{project_id}/services/{api}"
+        try:
+            client.enable_service(request={"name": service_name})
+        except Exception as e:
+            if "SERVICE_DISABLED" in str(e) and "serviceusage" in api:
+                logger.warning(
+                    "Service Usage API not enabled. Run once:\n"
+                    "  gcloud services enable serviceusage.googleapis.com "
+                    f"--project={project_id}"
+                )
+                return
 
 
 def compute_resource_tier(
