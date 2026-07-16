@@ -70,6 +70,11 @@ class CloudScheduler(ABC):
         ...
 
     @abstractmethod
+    def get_last_execution_status(self, job: CloudScheduleJob) -> Optional[dict]:
+        """Return last completed Cloud Run Job execution status, or None."""
+        ...
+
+    @abstractmethod
     def pause(self, job: CloudScheduleJob) -> None:
         """Pause a scheduled job (stops triggering without removing it)."""
         ...
