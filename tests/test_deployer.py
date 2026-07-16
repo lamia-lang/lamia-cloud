@@ -2,16 +2,23 @@
 
 import io
 import tarfile
+import urllib.parse
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 import lamia_cloud.gcp.deployer as deployer_module
 from lamia_cloud.contracts import FileSyncEntry
 from lamia_cloud.gcp.deployer import (
+    _cloud_logging_url,
     _extract_capability_flags,
+    _memory_to_mib,
+    collect_project_files,
     compute_resource_tier,
     create_source_tarball,
+    deployment_name,
+    fetch_execution_logs,
     package_deployment,
     sync_files_to_bucket,
 )
@@ -60,7 +67,6 @@ class TestPackageDeployment:
         assert (project / "helpers.py").exists()
         assert (project / "data.json").exists()
 
-
     def test_env_files_excluded_from_deployment(self, tmp_path):
         """SECURITY: .env files must never be baked into Docker images."""
         (tmp_path / "hello.lm").write_text('print("hi")')
@@ -106,6 +112,23 @@ class TestCreateSourceTarball:
             assert "requirements.txt" in names
 
 
+class TestMemoryToMib:
+    def test_gibibytes(self):
+        assert _memory_to_mib("4Gi") == 4096
+
+    def test_mebibytes(self):
+        assert _memory_to_mib("512Mi") == 512
+
+    def test_gigabytes(self):
+        assert _memory_to_mib("2G") == 2048
+
+    def test_megabytes(self):
+        assert _memory_to_mib("1024M") == 1024
+
+    def test_garbage_input_defaults_to_512(self):
+        assert _memory_to_mib("not-a-memory-value") == 512
+
+
 class TestResourceTierCalculation:
     def test_default_tier_is_smallest(self):
         assert compute_resource_tier() == ("512Mi", "1")
@@ -119,8 +142,10 @@ class TestResourceTierCalculation:
     def test_file_context_only_tier(self):
         assert compute_resource_tier(uses_file_context=True) == ("1Gi", "1")
 
-    def test_browser_tier_dominates(self):
+    def test_browser_tier(self):
         assert compute_resource_tier(uses_browser=True) == ("4Gi", "2")
+
+    def test_combined_flags_browser_dominates(self):
         assert compute_resource_tier(
             uses_llm=True,
             uses_browser=True,
@@ -161,6 +186,77 @@ class TestCapabilityContract:
             ),
         ):
             _extract_capability_flags(payload)
+
+    def test_extract_capability_flags_raises_on_non_dict(self):
+        with pytest.raises(ValueError, match="expected dict-like mapping"):
+            _extract_capability_flags("not-a-dict")
+
+
+class TestCollectProjectFiles:
+    def test_collects_supported_files_and_excludes_env(self, tmp_path):
+        (tmp_path / "script.lm").write_text("def run(): pass")
+        (tmp_path / "helpers.py").write_text("x = 1")
+        (tmp_path / "config.yaml").write_text("cloud:\n  project_id: proj")
+        (tmp_path / ".env").write_text("SECRET=leak")
+        subdir = tmp_path / "lib"
+        subdir.mkdir()
+        (subdir / "util.py").write_text("def util(): pass")
+
+        collected = {f.name for f in collect_project_files(tmp_path)}
+
+        assert collected == {"script.lm", "helpers.py", "config.yaml", "util.py"}
+        assert ".env" not in collected
+
+
+class TestDeploymentName:
+    def test_prepends_lamia_prefix(self):
+        assert deployment_name("hello") == "lamia-hello"
+
+
+class TestCloudLoggingUrl:
+    def test_builds_filtered_console_url(self):
+        url = _cloud_logging_url(
+            project_id="my-project",
+            target="lamia-hello",
+            execution_name="projects/p/locations/l/jobs/j/executions/exec-123",
+        )
+        assert url.startswith("https://console.cloud.google.com/logs/query;")
+        assert "project=my-project" in url
+        assert "lamia-hello" in url
+        assert "exec-123" in urllib.parse.unquote(url)
+
+
+class TestFetchExecutionLogs:
+    @patch("lamia_cloud.gcp.deployer.cloud_logging.Client")
+    def test_splits_stdout_and_stderr_by_severity(self, mock_client_cls):
+        info_entry = MagicMock()
+        info_entry.payload = "hello stdout"
+        info_entry.severity = "INFO"
+
+        error_entry = MagicMock()
+        error_entry.payload = "something failed"
+        error_entry.severity = "ERROR"
+
+        warning_entry = MagicMock()
+        warning_entry.payload = "watch out"
+        warning_entry.severity = "WARNING"
+
+        mock_client = MagicMock()
+        mock_client.list_entries.return_value = [info_entry, error_entry, warning_entry]
+        mock_client_cls.return_value = mock_client
+
+        stdout, stderr = fetch_execution_logs(
+            project_id="proj",
+            target="lamia-task",
+            execution_name="projects/p/locations/l/jobs/j/executions/exec-1",
+        )
+
+        assert stdout == "hello stdout"
+        assert stderr == "something failed\nwatch out"
+        mock_client.list_entries.assert_called_once()
+        filter_arg = mock_client.list_entries.call_args.kwargs["filter_"]
+        assert 'resource.labels.job_name="lamia-task"' in filter_arg
+        assert 'execution_name"="exec-1"' in filter_arg
 
 
 class _FakeBlob:
