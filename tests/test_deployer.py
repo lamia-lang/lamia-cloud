@@ -258,11 +258,6 @@ class TestEnsureApisEnabled:
             f"projects/my-project/services/{api}" for api in _REQUIRED_GCP_APIS
         ]
 
-    def test_no_crash_when_service_usage_not_importable(self, monkeypatch):
-        monkeypatch.setattr(deployer_module, "service_usage_v1", None)
-
-        ensure_apis_enabled("my-project")
-
     @patch("lamia_cloud.gcp.deployer.service_usage_v1")
     def test_idempotent_when_called_twice(self, mock_service_usage):
         mock_client = MagicMock()

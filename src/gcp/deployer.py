@@ -23,17 +23,19 @@ from pathlib import Path
 from typing import Optional
 
 from google.api_core.exceptions import NotFound
-from google.cloud import iam_admin_v1, logging as cloud_logging, resourcemanager_v3, run_v2, storage
+from google.cloud import (
+    iam_admin_v1,
+    logging as cloud_logging,
+    resourcemanager_v3,
+    run_v2,
+    service_usage_v1,
+    storage,
+)
 from google.cloud.devtools import cloudbuild_v1
 from google.iam.v1 import policy_pb2
 
 from lamia_cloud.contracts import SCRIPT_CAPABILITY_FIELDS, SOURCE_HASH_LABEL
 from lamia_cloud.file_sync import file_sha256
-
-try:
-    from google.cloud import service_usage_v1
-except ImportError:
-    service_usage_v1 = None
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +57,8 @@ _REQUIRED_GCP_APIS = (
 def ensure_apis_enabled(project_id: str) -> None:
     """Enable all required GCP APIs automatically.
 
-    Idempotent and safe to call multiple times. No-op when service_usage_v1
-    is not installed.
+    Idempotent and safe to call multiple times.
     """
-    if service_usage_v1 is None:
-        return
-
     client = service_usage_v1.ServiceUsageClient()
     for api in _REQUIRED_GCP_APIS:
         service_name = f"projects/{project_id}/services/{api}"
