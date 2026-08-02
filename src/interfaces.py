@@ -104,6 +104,11 @@ class CloudTriggerProvider(ABC):
         ...
 
     @abstractmethod
+    def fetch_logs(self, name: str) -> dict:
+        """Fetch logs from the most recent run. Returns {stdout, stderr, logs_url}."""
+        ...
+
+    @abstractmethod
     def deploy(self, plan: "TriggerDeploymentPlan") -> str:
         """Deploy all stages + orchestration + event routing. Returns deployment_id."""
         ...

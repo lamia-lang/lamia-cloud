@@ -15,11 +15,11 @@ from pathlib import Path
 from typing import Optional
 
 from google.api_core.exceptions import AlreadyExists, NotFound
-from google.cloud import eventarc_v1, monitoring_v3, scheduler_v1, workflows_v1, pubsub_v1
+from google.cloud import eventarc_v1, monitoring_v3, run_v2, scheduler_v1, workflows_v1, pubsub_v1
 
 from lamia_cloud.interfaces import CloudTriggerProvider
 from lamia_cloud.types import TriggerDeploymentPlan, TriggerStage
-from lamia_cloud.gcp.deployer import deploy, teardown, deployment_name
+from lamia_cloud.gcp.deployer import deploy, fetch_latest_logs, teardown, deployment_name
 from lamia_cloud.gcp.workflow_generator import (
     generate_workflow_yaml,
     generate_drain_workflow_yaml,
@@ -204,6 +204,50 @@ class GCPTriggerProvider(CloudTriggerProvider):
         except Exception as e:
             logger.warning(f"Failed to list workflows: {e}")
         return deployments
+
+    def _stage_job_names(self, name: str) -> list[str]:
+        """Cloud Run Jobs backing a trigger, in stage order.
+
+        Single-stage triggers deploy one job named after the trigger; multi-stage
+        triggers append a -stage-N suffix per stage.
+        """
+        prefix = deployment_name(name)
+        client = run_v2.JobsClient()
+        parent = f"projects/{self.project_id}/locations/{self.location}"
+        job_names = []
+        for job in client.list_jobs(parent=parent):
+            short = job.name.split("/")[-1]
+            if short == prefix or short.startswith(f"{prefix}-stage-"):
+                job_names.append(short)
+        return sorted(job_names)
+
+    def fetch_logs(self, name: str) -> dict:
+        """Fetch logs from the most recent run, concatenated across stages."""
+        job_names = self._stage_job_names(name)
+        if not job_names:
+            raise ValueError(f"No deployed jobs found for trigger '{name}'")
+
+        stdout_parts = []
+        stderr_parts = []
+        logs_url = ""
+        for job_name in job_names:
+            try:
+                stdout, stderr, url = fetch_latest_logs(
+                    project_id=self.project_id,
+                    location=self.location,
+                    target=job_name,
+                )
+            except ValueError:
+                continue
+            stdout_parts.append(stdout)
+            stderr_parts.append(stderr)
+            logs_url = logs_url or url
+
+        return {
+            "stdout": "\n".join(p for p in stdout_parts if p),
+            "stderr": "\n".join(p for p in stderr_parts if p),
+            "logs_url": logs_url,
+        }
 
     def _stage_job_name(self, plan_name: str, stage_index: int, total_stages: int) -> str:
         if total_stages == 1:
