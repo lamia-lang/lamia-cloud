@@ -22,7 +22,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Optional
 
-from google.api_core.exceptions import NotFound
+from google.api_core import protobuf_helpers
+from google.api_core.exceptions import GoogleAPICallError, NotFound
 from google.cloud import (
     iam_admin_v1,
     logging as cloud_logging,
@@ -471,8 +472,8 @@ def deploy_job(
 def _execution_from_operation(operation) -> Optional[run_v2.Execution]:
     """Extract Execution metadata from a completed run_job LRO.
 
-    When a container crashes, operation.result() raises Aborted but the LRO
-    metadata still contains the Execution resource with its name and timing.
+    When a container crashes, operation.result() raises, but the LRO metadata
+    still contains the Execution resource with its name and timing.
     """
     metadata = operation.metadata
     if metadata and getattr(metadata, "name", None):
@@ -480,8 +481,6 @@ def _execution_from_operation(operation) -> Optional[run_v2.Execution]:
 
     op = operation.operation
     if op.HasField("response"):
-        from google.api_core import protobuf_helpers
-
         execution = protobuf_helpers.from_any_pb(run_v2.Execution, op.response)
         if execution.name:
             return execution
@@ -540,7 +539,7 @@ def run_job(
     operation = client.run_job(request=request)
     try:
         execution = operation.result()
-    except Aborted:
+    except GoogleAPICallError:
         execution = _execution_from_operation(operation)
         if execution is None:
             raise

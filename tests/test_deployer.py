@@ -288,6 +288,69 @@ class TestRunJob:
         assert "exec-123" in result["logs_url"]
         assert "console.cloud.google.com/logs" in result["logs_url"]
 
+    def test_run_job_recovers_logs_on_non_aborted_failure(self, monkeypatch):
+        """Timeouts and cancellations also leave an Execution worth reporting."""
+        from google.api_core.exceptions import DeadlineExceeded
+        from google.cloud import run_v2
+        from google.protobuf import timestamp_pb2
+
+        execution_meta = run_v2.Execution(
+            name="projects/p/locations/us-central1/jobs/lamia-test/executions/exec-slow",
+            succeeded_count=0,
+            failed_count=1,
+            start_time=timestamp_pb2.Timestamp(seconds=100),
+            completion_time=timestamp_pb2.Timestamp(seconds=130),
+        )
+
+        class FakeOperation:
+            def result(self):
+                raise DeadlineExceeded("Execution timed out")
+
+            @property
+            def metadata(self):
+                return execution_meta
+
+            @property
+            def operation(self):
+                return type("Op", (), {"HasField": lambda self, f: False})()
+
+        monkeypatch.setattr(
+            deployer_module.run_v2,
+            "JobsClient",
+            lambda: type("C", (), {"run_job": lambda self, request: FakeOperation()})(),
+        )
+
+        result = run_job("p", "us-central1", "lamia-test")
+
+        assert result["exit_code"] == 1
+        assert result["execution_name"].endswith("/executions/exec-slow")
+        assert result["elapsed_seconds"] == 30.0
+
+    def test_run_job_reraises_when_no_execution_exists(self, monkeypatch):
+        """API errors that never produced an Execution must not be swallowed."""
+        from google.api_core.exceptions import PermissionDenied
+
+        class FakeOperation:
+            def result(self):
+                raise PermissionDenied("caller lacks run.jobs.run")
+
+            @property
+            def metadata(self):
+                return None
+
+            @property
+            def operation(self):
+                return type("Op", (), {"HasField": lambda self, f: False})()
+
+        monkeypatch.setattr(
+            deployer_module.run_v2,
+            "JobsClient",
+            lambda: type("C", (), {"run_job": lambda self, request: FakeOperation()})(),
+        )
+
+        with pytest.raises(PermissionDenied):
+            run_job("p", "us-central1", "lamia-test")
+
     def test_run_job_success_path(self, monkeypatch):
         from google.cloud import run_v2
         from google.protobuf import timestamp_pb2
