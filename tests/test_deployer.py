@@ -3,17 +3,20 @@
 import io
 import tarfile
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 import lamia_cloud.gcp.deployer as deployer_module
 from lamia_cloud.contracts import FileSyncEntry
 from lamia_cloud.gcp.deployer import (
+    _REQUIRED_GCP_APIS,
     _extract_capability_flags,
     _execution_from_operation,
     _result_from_execution,
     compute_resource_tier,
     create_source_tarball,
+    ensure_apis_enabled,
     package_deployment,
     run_job,
     sync_files_to_bucket,
@@ -38,6 +41,7 @@ class TestPackageDeployment:
         staging = package_deployment(tmp_path, "hello.lm", "abc123")
         reqs = (staging / "requirements.txt").read_text()
         assert "lamia-lang" in reqs
+        assert "lamia-cloud" in reqs
 
     def test_preserves_existing_requirements(self, tmp_path):
         script = tmp_path / "hello.lm"
@@ -47,6 +51,7 @@ class TestPackageDeployment:
         staging = package_deployment(tmp_path, "hello.lm", "abc123")
         reqs = (staging / "requirements.txt").read_text()
         assert "lamia-lang" in reqs
+        assert "lamia-cloud" in reqs
         assert "requests>=2.0" in reqs
         assert "pandas" in reqs
 
@@ -342,3 +347,44 @@ class TestRunJob:
         assert result["execution_name"] == execution.name
         assert "my-project" in result["logs_url"]
         assert "lamia-hello" in result["logs_url"]
+
+class TestEnsureApisEnabled:
+    @patch("lamia_cloud.gcp.deployer.service_usage_v1")
+    def test_enables_all_required_apis(self, mock_service_usage):
+        mock_client = MagicMock()
+        mock_service_usage.ServiceUsageClient.return_value = mock_client
+
+        ensure_apis_enabled("my-project")
+
+        mock_service_usage.ServiceUsageClient.assert_called_once()
+        enabled_services = [
+            call.kwargs["request"]["name"]
+            for call in mock_client.enable_service.call_args_list
+        ]
+        assert enabled_services == [
+            f"projects/my-project/services/{api}" for api in _REQUIRED_GCP_APIS
+        ]
+
+    @patch("lamia_cloud.gcp.deployer.service_usage_v1")
+    def test_idempotent_when_called_twice(self, mock_service_usage):
+        mock_client = MagicMock()
+        mock_service_usage.ServiceUsageClient.return_value = mock_client
+
+        ensure_apis_enabled("my-project")
+        ensure_apis_enabled("my-project")
+
+        assert mock_client.enable_service.call_count == len(_REQUIRED_GCP_APIS) * 2
+
+    @patch("lamia_cloud.gcp.deployer.service_usage_v1")
+    def test_warns_when_service_usage_api_disabled(self, mock_service_usage, caplog):
+        mock_client = MagicMock()
+        mock_service_usage.ServiceUsageClient.return_value = mock_client
+        mock_client.enable_service.side_effect = Exception(
+            "SERVICE_DISABLED: serviceusage.googleapis.com"
+        )
+
+        with caplog.at_level("WARNING"):
+            ensure_apis_enabled("my-project")
+
+        assert "Service Usage API not enabled" in caplog.text
+        assert mock_client.enable_service.call_count == 1

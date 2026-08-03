@@ -22,8 +22,15 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Optional
 
-from google.api_core.exceptions import Aborted, NotFound
-from google.cloud import iam_admin_v1, logging as cloud_logging, resourcemanager_v3, run_v2, storage
+from google.api_core.exceptions import NotFound
+from google.cloud import (
+    iam_admin_v1,
+    logging as cloud_logging,
+    resourcemanager_v3,
+    run_v2,
+    service_usage_v1,
+    storage,
+)
 from google.cloud.devtools import cloudbuild_v1
 from google.iam.v1 import policy_pb2
 
@@ -34,6 +41,37 @@ logger = logging.getLogger(__name__)
 
 TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 FILES_MOUNT_PATH = "/mnt/lamia-files"
+
+_REQUIRED_GCP_APIS = (
+    "serviceusage.googleapis.com",
+    "cloudscheduler.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "run.googleapis.com",
+    "storage.googleapis.com",
+    "aiplatform.googleapis.com",
+    "iam.googleapis.com",
+    "logging.googleapis.com",
+)
+
+
+def ensure_apis_enabled(project_id: str) -> None:
+    """Enable all required GCP APIs automatically.
+
+    Idempotent and safe to call multiple times.
+    """
+    client = service_usage_v1.ServiceUsageClient()
+    for api in _REQUIRED_GCP_APIS:
+        service_name = f"projects/{project_id}/services/{api}"
+        try:
+            client.enable_service(request={"name": service_name})
+        except Exception as e:
+            if "SERVICE_DISABLED" in str(e) and "serviceusage" in api:
+                logger.warning(
+                    "Service Usage API not enabled. Run once:\n"
+                    "  gcloud services enable serviceusage.googleapis.com "
+                    f"--project={project_id}"
+                )
+                return
 
 
 def compute_resource_tier(
@@ -216,6 +254,8 @@ def package_deployment(
         reqs = ""
     if "lamia-lang" not in reqs:
         reqs = "lamia-lang\n" + reqs
+    if "lamia-cloud" not in reqs:
+        reqs += "lamia-cloud\n"
     if "google-auth" not in reqs:
         reqs += "google-auth\n"
     requirements.write_text(reqs)
