@@ -52,9 +52,6 @@ Homepage = "https://github.com/lamia-lang/lamia-cloud"
 Repository = "https://github.com/lamia-lang/lamia-cloud"
 Issues = "https://github.com/lamia-lang/lamia-cloud/issues"
 
-[project.entry-points."lamia.cloud_providers"]
-default = "lamia_cloud:LamiaCloudProvider"
-
 [tool.setuptools]
 package-dir = {"lamia_cloud" = "src", "lamia_cloud.gcp" = "src/gcp"}
 packages = ["lamia_cloud", "lamia_cloud.gcp"]
