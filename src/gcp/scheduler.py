@@ -13,40 +13,14 @@ from google.cloud import run_v2
 
 from lamia_cloud.interfaces import CloudScheduler
 from lamia_cloud.types import CloudScheduleJob, CloudJobStatus
-from lamia_cloud.gcp.deployer import deploy, teardown, run_job, fetch_execution_logs, deployment_name
+from lamia_cloud.gcp.deployer import deploy, deployment_name, teardown, run_job, fetch_execution_logs, fetch_latest_logs
 
 logger = logging.getLogger(__name__)
 
 
 def _enable_apis(project_id: str) -> None:
     """Enable all required GCP APIs automatically."""
-    try:
-        from google.cloud import service_usage_v1
-        client = service_usage_v1.ServiceUsageClient()
-        apis = [
-            "serviceusage.googleapis.com",
-            "cloudscheduler.googleapis.com",
-            "cloudbuild.googleapis.com",
-            "run.googleapis.com",
-            "storage.googleapis.com",
-            "aiplatform.googleapis.com",
-            "iam.googleapis.com",
-            "logging.googleapis.com",
-        ]
-        for api in apis:
-            service_name = f"projects/{project_id}/services/{api}"
-            try:
-                client.enable_service(request={"name": service_name})
-            except Exception as e:
-                if "SERVICE_DISABLED" in str(e) and "serviceusage" in api:
-                    logger.warning(
-                        f"Service Usage API not enabled. Run once:\n"
-                        f"  gcloud services enable serviceusage.googleapis.com "
-                        f"--project={project_id}"
-                    )
-                    return
-    except ImportError:
-        pass
+    ensure_apis_enabled(project_id)
 
 
 class GCPCloudScheduler(CloudScheduler):
@@ -238,6 +212,19 @@ class GCPCloudScheduler(CloudScheduler):
             "success": latest.succeeded_count > 0,
             "exit_code": exit_code,
         }
+
+    def fetch_logs(self, job: CloudScheduleJob) -> dict:
+        """Fetch logs from the most recent execution.
+
+        Returns {stdout, stderr, logs_url}.
+        """
+        cr_job_name = deployment_name(job.schedule_id)
+        stdout, stderr, logs_url = fetch_latest_logs(
+            project_id=self.project_id,
+            location=self.location,
+            target=cr_job_name,
+        )
+        return {"stdout": stdout, "stderr": stderr, "logs_url": logs_url}
 
     def run_once(self, job: CloudScheduleJob, verbose: bool = False) -> dict:
         """Deploy and invoke once without scheduling."""

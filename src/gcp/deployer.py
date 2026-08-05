@@ -22,8 +22,16 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Optional
 
-from google.api_core.exceptions import NotFound
-from google.cloud import iam_admin_v1, logging as cloud_logging, resourcemanager_v3, run_v2, storage
+from google.api_core import protobuf_helpers
+from google.api_core.exceptions import GoogleAPICallError, NotFound
+from google.cloud import (
+    iam_admin_v1,
+    logging as cloud_logging,
+    resourcemanager_v3,
+    run_v2,
+    service_usage_v1,
+    storage,
+)
 from google.cloud.devtools import cloudbuild_v1
 from google.iam.v1 import policy_pb2
 
@@ -34,6 +42,37 @@ logger = logging.getLogger(__name__)
 
 TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 FILES_MOUNT_PATH = "/mnt/lamia-files"
+
+_REQUIRED_GCP_APIS = (
+    "serviceusage.googleapis.com",
+    "cloudscheduler.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "run.googleapis.com",
+    "storage.googleapis.com",
+    "aiplatform.googleapis.com",
+    "iam.googleapis.com",
+    "logging.googleapis.com",
+)
+
+
+def ensure_apis_enabled(project_id: str) -> None:
+    """Enable all required GCP APIs automatically.
+
+    Idempotent and safe to call multiple times.
+    """
+    client = service_usage_v1.ServiceUsageClient()
+    for api in _REQUIRED_GCP_APIS:
+        service_name = f"projects/{project_id}/services/{api}"
+        try:
+            client.enable_service(request={"name": service_name})
+        except Exception as e:
+            if "SERVICE_DISABLED" in str(e) and "serviceusage" in api:
+                logger.warning(
+                    "Service Usage API not enabled. Run once:\n"
+                    "  gcloud services enable serviceusage.googleapis.com "
+                    f"--project={project_id}"
+                )
+                return
 
 
 def compute_resource_tier(
@@ -216,6 +255,8 @@ def package_deployment(
         reqs = ""
     if "lamia-lang" not in reqs:
         reqs = "lamia-lang\n" + reqs
+    if "lamia-cloud" not in reqs:
+        reqs += "lamia-cloud\n"
     if "google-auth" not in reqs:
         reqs += "google-auth\n"
     requirements.write_text(reqs)
@@ -428,6 +469,46 @@ def deploy_job(
     _allow_scheduler_job_invocation(project_id, location, job_name)
 
 
+def _execution_from_operation(operation) -> Optional[run_v2.Execution]:
+    """Extract Execution metadata from a completed run_job LRO.
+
+    When a container crashes, operation.result() raises, but the LRO metadata
+    still contains the Execution resource with its name and timing.
+    """
+    metadata = operation.metadata
+    if metadata and getattr(metadata, "name", None):
+        return metadata
+
+    op = operation.operation
+    if op.HasField("response"):
+        execution = protobuf_helpers.from_any_pb(run_v2.Execution, op.response)
+        if execution.name:
+            return execution
+
+    return None
+
+
+def _result_from_execution(
+    project_id: str,
+    target: str,
+    execution: run_v2.Execution,
+) -> dict:
+    """Build the run_job result dict from an Execution resource."""
+    exit_code = 0 if execution.succeeded_count > 0 else 1
+    elapsed = 0.0
+    if execution.completion_time and execution.start_time:
+        elapsed = (execution.completion_time - execution.start_time).total_seconds()
+
+    logs_url = _cloud_logging_url(project_id, target, execution.name)
+
+    return {
+        "exit_code": exit_code,
+        "elapsed_seconds": elapsed,
+        "logs_url": logs_url,
+        "execution_name": execution.name,
+    }
+
+
 def run_job(
     project_id: str,
     location: str,
@@ -456,21 +537,15 @@ def run_job(
         request.overrides = overrides
 
     operation = client.run_job(request=request)
-    execution = operation.result()
+    try:
+        execution = operation.result()
+    except GoogleAPICallError:
+        execution = _execution_from_operation(operation)
+        if execution is None:
+            raise
+        return _result_from_execution(project_id, target, execution)
 
-    exit_code = 0 if execution.succeeded_count > 0 else 1
-    elapsed = 0.0
-    if execution.completion_time and execution.start_time:
-        elapsed = (execution.completion_time - execution.start_time).total_seconds()
-
-    logs_url = _cloud_logging_url(project_id, target, execution.name)
-
-    return {
-        "exit_code": exit_code,
-        "elapsed_seconds": elapsed,
-        "logs_url": logs_url,
-        "execution_name": execution.name,
-    }
+    return _result_from_execution(project_id, target, execution)
 
 
 def _cloud_logging_url(project_id: str, target: str, execution_name: str) -> str:
@@ -515,6 +590,41 @@ def fetch_execution_logs(
             stdout_lines.append(text)
 
     return "\n".join(stdout_lines), "\n".join(stderr_lines)
+
+
+def _is_execution_completed(execution: run_v2.Execution) -> bool:
+    return execution.completion_time is not None
+
+
+def fetch_latest_logs(
+    project_id: str,
+    location: str,
+    target: str,
+) -> tuple[str, str, str]:
+    """Fetch logs from the most recent completed execution of a Cloud Run Job.
+
+    Returns (stdout, stderr, logs_url). Raises if no executions exist.
+    """
+    client = run_v2.ExecutionsClient()
+    parent = f"projects/{project_id}/locations/{location}/jobs/{target}"
+
+    seen_any = False
+    latest_completed = None
+    for execution in client.list_executions(request={"parent": parent, "page_size": 1}):
+        seen_any = True
+        if _is_execution_completed(execution):
+            latest_completed = execution
+            break
+
+    if not seen_any:
+        raise ValueError(f"No executions found for job {target}")
+    if latest_completed is None:
+        raise ValueError(f"No completed executions found for job {target}")
+
+    logs_url = _cloud_logging_url(project_id, target, latest_completed.name)
+    stdout, stderr = fetch_execution_logs(project_id, target, latest_completed.name)
+    return stdout, stderr, logs_url
+
 
 
 def _ensure_service_account(project_id: str) -> str:

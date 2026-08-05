@@ -8,6 +8,7 @@ payload parsing), not the GCP SDK itself.
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
 from google.api_core.exceptions import NotFound
 
 from lamia_cloud.gcp.trigger_provider import (
@@ -199,3 +200,71 @@ class TestGetFailedEventCount:
         mock_client_cls.side_effect = Exception("boom")
         provider = GCPTriggerProvider(project_id="proj", location="us-central1")
         assert provider._get_failed_event_count("my-trigger") == 0
+
+
+def _mock_job(short_name: str):
+    job = MagicMock()
+    job.name = f"projects/proj/locations/us-central1/jobs/{short_name}"
+    return job
+
+
+class TestFetchLogs:
+    @patch("lamia_cloud.gcp.trigger_provider.fetch_latest_logs")
+    @patch("lamia_cloud.gcp.trigger_provider.run_v2.JobsClient")
+    def test_single_stage_trigger(self, mock_client_cls, mock_fetch):
+        mock_client_cls.return_value.list_jobs.return_value = [
+            _mock_job("lamia-my-trigger"),
+            _mock_job("lamia-other"),
+        ]
+        mock_fetch.return_value = ("out", "err", "https://logs")
+
+        provider = GCPTriggerProvider(project_id="proj", location="us-central1")
+        assert provider.fetch_logs("my-trigger") == {
+            "stdout": "out",
+            "stderr": "err",
+            "logs_url": "https://logs",
+        }
+        assert mock_fetch.call_count == 1
+
+    @patch("lamia_cloud.gcp.trigger_provider.fetch_latest_logs")
+    @patch("lamia_cloud.gcp.trigger_provider.run_v2.JobsClient")
+    def test_multi_stage_concatenates_in_order(self, mock_client_cls, mock_fetch):
+        mock_client_cls.return_value.list_jobs.return_value = [
+            _mock_job("lamia-my-trigger-stage-2"),
+            _mock_job("lamia-my-trigger-stage-1"),
+        ]
+        mock_fetch.side_effect = [
+            ("first", "", "https://logs/1"),
+            ("second", "", "https://logs/2"),
+        ]
+
+        provider = GCPTriggerProvider(project_id="proj", location="us-central1")
+        result = provider.fetch_logs("my-trigger")
+
+        assert result["stdout"] == "first\nsecond"
+        assert result["logs_url"] == "https://logs/1"
+        targets = [call.kwargs["target"] for call in mock_fetch.call_args_list]
+        assert targets == ["lamia-my-trigger-stage-1", "lamia-my-trigger-stage-2"]
+
+    @patch("lamia_cloud.gcp.trigger_provider.run_v2.JobsClient")
+    def test_raises_when_no_jobs_deployed(self, mock_client_cls):
+        mock_client_cls.return_value.list_jobs.return_value = []
+
+        provider = GCPTriggerProvider(project_id="proj", location="us-central1")
+        with pytest.raises(ValueError, match="No deployed jobs"):
+            provider.fetch_logs("my-trigger")
+
+    @patch("lamia_cloud.gcp.trigger_provider.fetch_latest_logs")
+    @patch("lamia_cloud.gcp.trigger_provider.run_v2.JobsClient")
+    def test_skips_stages_that_never_ran(self, mock_client_cls, mock_fetch):
+        mock_client_cls.return_value.list_jobs.return_value = [
+            _mock_job("lamia-my-trigger-stage-1"),
+            _mock_job("lamia-my-trigger-stage-2"),
+        ]
+        mock_fetch.side_effect = [
+            ("ran", "", "https://logs/1"),
+            ValueError("No executions found"),
+        ]
+
+        provider = GCPTriggerProvider(project_id="proj", location="us-central1")
+        assert provider.fetch_logs("my-trigger")["stdout"] == "ran"

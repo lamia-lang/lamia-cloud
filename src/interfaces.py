@@ -85,6 +85,11 @@ class CloudScheduler(ABC):
         ...
 
     @abstractmethod
+    def fetch_logs(self, job: CloudScheduleJob) -> dict:
+        """Fetch logs from the most recent execution. Returns {stdout, stderr, logs_url}."""
+        ...
+
+    @abstractmethod
     def run_once(self, job: CloudScheduleJob, verbose: bool = False) -> dict:
         """Deploy and invoke once without scheduling. Returns {exit_code, stdout, stderr, logs_url}."""
         ...
@@ -101,6 +106,11 @@ class CloudTriggerProvider(ABC):
     @abstractmethod
     def from_config(cls, cloud_cfg: dict) -> "CloudTriggerProvider":
         """Create instance from config.yaml cloud section."""
+        ...
+
+    @abstractmethod
+    def fetch_logs(self, name: str) -> dict:
+        """Fetch logs from the most recent run. Returns {stdout, stderr, logs_url}."""
         ...
 
     @abstractmethod
