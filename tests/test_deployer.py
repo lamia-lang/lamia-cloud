@@ -11,6 +11,10 @@ import pytest
 import lamia_cloud.gcp.deployer as deployer_module
 from lamia_cloud.contracts import FileSyncEntry
 from lamia_cloud.gcp.deployer import (
+      _REQUIRED_GCP_APIS,
+    _extract_capability_flags,
+    _execution_from_operation,
+    _result_from_execution,
     _cloud_logging_url,
     _extract_capability_flags,
     _memory_to_mib,
@@ -19,7 +23,11 @@ from lamia_cloud.gcp.deployer import (
     create_source_tarball,
     deployment_name,
     fetch_execution_logs,
+    compute_resource_tier,
+    create_source_tarball,
+    ensure_apis_enabled,
     package_deployment,
+    run_job,
     sync_files_to_bucket,
 )
 
@@ -42,6 +50,7 @@ class TestPackageDeployment:
         staging = package_deployment(tmp_path, "hello.lm", "abc123")
         reqs = (staging / "requirements.txt").read_text()
         assert "lamia-lang" in reqs
+        assert "lamia-cloud" in reqs
 
     def test_preserves_existing_requirements(self, tmp_path):
         script = tmp_path / "hello.lm"
@@ -51,6 +60,7 @@ class TestPackageDeployment:
         staging = package_deployment(tmp_path, "hello.lm", "abc123")
         reqs = (staging / "requirements.txt").read_text()
         assert "lamia-lang" in reqs
+        assert "lamia-cloud" in reqs
         assert "requests>=2.0" in reqs
         assert "pandas" in reqs
 
@@ -332,3 +342,210 @@ class TestIncrementalFileSync:
         result = sync_files_to_bucket("proj", "bucket", plan)
         assert result["uploaded"] == 1
         assert len(result["overwrite_warnings"]) == 1
+
+
+class TestRunJob:
+    def test_run_job_returns_failure_on_aborted(self, monkeypatch):
+        from google.api_core.exceptions import Aborted
+        from google.cloud import run_v2
+        from google.protobuf import timestamp_pb2
+
+        start = timestamp_pb2.Timestamp(seconds=100, nanos=0)
+        end = timestamp_pb2.Timestamp(seconds=110, nanos=0)
+        execution_meta = run_v2.Execution(
+            name="projects/p/locations/us-central1/jobs/lamia-test/executions/exec-123",
+            succeeded_count=0,
+            failed_count=1,
+            start_time=start,
+            completion_time=end,
+        )
+
+        class FakeOperation:
+            def result(self):
+                raise Aborted("The container exited with an error")
+
+            @property
+            def metadata(self):
+                return execution_meta
+
+            @property
+            def operation(self):
+                return type("Op", (), {"HasField": lambda self, f: False})()
+
+        class FakeClient:
+            def run_job(self, request):
+                return FakeOperation()
+
+        monkeypatch.setattr(deployer_module.run_v2, "JobsClient", lambda: FakeClient())
+
+        result = run_job("p", "us-central1", "lamia-test")
+
+        assert result["exit_code"] == 1
+        assert result["execution_name"].endswith("/executions/exec-123")
+        assert result["elapsed_seconds"] == 10.0
+        assert "exec-123" in result["logs_url"]
+        assert "console.cloud.google.com/logs" in result["logs_url"]
+
+    def test_run_job_recovers_logs_on_non_aborted_failure(self, monkeypatch):
+        """Timeouts and cancellations also leave an Execution worth reporting."""
+        from google.api_core.exceptions import DeadlineExceeded
+        from google.cloud import run_v2
+        from google.protobuf import timestamp_pb2
+
+        execution_meta = run_v2.Execution(
+            name="projects/p/locations/us-central1/jobs/lamia-test/executions/exec-slow",
+            succeeded_count=0,
+            failed_count=1,
+            start_time=timestamp_pb2.Timestamp(seconds=100),
+            completion_time=timestamp_pb2.Timestamp(seconds=130),
+        )
+
+        class FakeOperation:
+            def result(self):
+                raise DeadlineExceeded("Execution timed out")
+
+            @property
+            def metadata(self):
+                return execution_meta
+
+            @property
+            def operation(self):
+                return type("Op", (), {"HasField": lambda self, f: False})()
+
+        monkeypatch.setattr(
+            deployer_module.run_v2,
+            "JobsClient",
+            lambda: type("C", (), {"run_job": lambda self, request: FakeOperation()})(),
+        )
+
+        result = run_job("p", "us-central1", "lamia-test")
+
+        assert result["exit_code"] == 1
+        assert result["execution_name"].endswith("/executions/exec-slow")
+        assert result["elapsed_seconds"] == 30.0
+
+    def test_run_job_reraises_when_no_execution_exists(self, monkeypatch):
+        """API errors that never produced an Execution must not be swallowed."""
+        from google.api_core.exceptions import PermissionDenied
+
+        class FakeOperation:
+            def result(self):
+                raise PermissionDenied("caller lacks run.jobs.run")
+
+            @property
+            def metadata(self):
+                return None
+
+            @property
+            def operation(self):
+                return type("Op", (), {"HasField": lambda self, f: False})()
+
+        monkeypatch.setattr(
+            deployer_module.run_v2,
+            "JobsClient",
+            lambda: type("C", (), {"run_job": lambda self, request: FakeOperation()})(),
+        )
+
+        with pytest.raises(PermissionDenied):
+            run_job("p", "us-central1", "lamia-test")
+
+    def test_run_job_success_path(self, monkeypatch):
+        from google.cloud import run_v2
+        from google.protobuf import timestamp_pb2
+
+        start = timestamp_pb2.Timestamp(seconds=200, nanos=0)
+        end = timestamp_pb2.Timestamp(seconds=205, nanos=500000000)
+        execution = run_v2.Execution(
+            name="projects/p/locations/us-central1/jobs/lamia-test/executions/exec-ok",
+            succeeded_count=1,
+            start_time=start,
+            completion_time=end,
+        )
+
+        class FakeOperation:
+            def result(self):
+                return execution
+
+        class FakeClient:
+            def run_job(self, request):
+                return FakeOperation()
+
+        monkeypatch.setattr(deployer_module.run_v2, "JobsClient", lambda: FakeClient())
+
+        result = run_job("p", "us-central1", "lamia-test")
+
+        assert result["exit_code"] == 0
+        assert result["elapsed_seconds"] == 5.5
+
+    def test_execution_from_operation_reads_metadata(self):
+        from google.cloud import run_v2
+
+        execution_meta = run_v2.Execution(
+            name="projects/p/locations/us-central1/jobs/lamia-test/executions/exec-meta",
+        )
+
+        class FakeOperation:
+            @property
+            def metadata(self):
+                return execution_meta
+
+            @property
+            def operation(self):
+                return type("Op", (), {"HasField": lambda self, f: False})()
+
+        extracted = _execution_from_operation(FakeOperation())
+        assert extracted.name.endswith("/executions/exec-meta")
+
+    def test_result_from_execution_builds_logs_url(self):
+        from google.cloud import run_v2
+
+        execution = run_v2.Execution(
+            name="projects/p/locations/us-central1/jobs/lamia-hello/executions/exec-1",
+            succeeded_count=0,
+        )
+        result = _result_from_execution("my-project", "lamia-hello", execution)
+        assert result["exit_code"] == 1
+        assert result["execution_name"] == execution.name
+        assert "my-project" in result["logs_url"]
+        assert "lamia-hello" in result["logs_url"]
+
+class TestEnsureApisEnabled:
+    @patch("lamia_cloud.gcp.deployer.service_usage_v1")
+    def test_enables_all_required_apis(self, mock_service_usage):
+        mock_client = MagicMock()
+        mock_service_usage.ServiceUsageClient.return_value = mock_client
+
+        ensure_apis_enabled("my-project")
+
+        mock_service_usage.ServiceUsageClient.assert_called_once()
+        enabled_services = [
+            call.kwargs["request"]["name"]
+            for call in mock_client.enable_service.call_args_list
+        ]
+        assert enabled_services == [
+            f"projects/my-project/services/{api}" for api in _REQUIRED_GCP_APIS
+        ]
+
+    @patch("lamia_cloud.gcp.deployer.service_usage_v1")
+    def test_idempotent_when_called_twice(self, mock_service_usage):
+        mock_client = MagicMock()
+        mock_service_usage.ServiceUsageClient.return_value = mock_client
+
+        ensure_apis_enabled("my-project")
+        ensure_apis_enabled("my-project")
+
+        assert mock_client.enable_service.call_count == len(_REQUIRED_GCP_APIS) * 2
+
+    @patch("lamia_cloud.gcp.deployer.service_usage_v1")
+    def test_warns_when_service_usage_api_disabled(self, mock_service_usage, caplog):
+        mock_client = MagicMock()
+        mock_service_usage.ServiceUsageClient.return_value = mock_client
+        mock_client.enable_service.side_effect = Exception(
+            "SERVICE_DISABLED: serviceusage.googleapis.com"
+        )
+
+        with caplog.at_level("WARNING"):
+            ensure_apis_enabled("my-project")
+
+        assert "Service Usage API not enabled" in caplog.text
+        assert mock_client.enable_service.call_count == 1
