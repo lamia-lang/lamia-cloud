@@ -9,6 +9,8 @@ import logging
 import time
 from typing import Optional
 
+from google.cloud import run_v2
+
 from lamia_cloud.interfaces import CloudScheduler
 from lamia_cloud.types import CloudScheduleJob, CloudJobStatus
 from lamia_cloud.gcp.deployer import deploy, deployment_name, teardown, run_job, fetch_execution_logs, fetch_latest_logs
@@ -184,6 +186,32 @@ class GCPCloudScheduler(CloudScheduler):
             }
         except Exception:
             return None
+
+    def get_last_execution_status(self, job: CloudScheduleJob) -> Optional[dict]:
+        """Return the last completed Cloud Run Job execution status, or None."""
+        client = run_v2.ExecutionsClient()
+        cr_job_name = deployment_name(job.schedule_id)
+        parent = f"projects/{self.project_id}/locations/{self.location}/jobs/{cr_job_name}"
+
+        latest = None
+        try:
+            for execution in client.list_executions(parent=parent):
+                if not execution.completion_time:
+                    continue
+                if latest is None or execution.completion_time > latest.completion_time:
+                    latest = execution
+        except Exception:
+            return None
+
+        if latest is None:
+            return None
+
+        exit_code = 0 if latest.succeeded_count > 0 else 1
+        return {
+            "timestamp": latest.completion_time.isoformat(),
+            "success": latest.succeeded_count > 0,
+            "exit_code": exit_code,
+        }
 
     def fetch_logs(self, job: CloudScheduleJob) -> dict:
         """Fetch logs from the most recent execution.
