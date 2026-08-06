@@ -20,6 +20,7 @@ from google.cloud import eventarc_v1, monitoring_v3, run_v2, scheduler_v1, workf
 from lamia_cloud.interfaces import CloudTriggerProvider
 from lamia_cloud.types import TriggerDeploymentPlan, TriggerStage
 from lamia_cloud.gcp.deployer import deploy, fetch_latest_logs, teardown, deployment_name
+from lamia_cloud.gcp.scheduler_job import build_scheduler_job, trigger_job_id
 from lamia_cloud.gcp.workflow_generator import (
     generate_workflow_yaml,
     generate_drain_workflow_yaml,
@@ -597,31 +598,21 @@ class GCPTriggerProvider(CloudTriggerProvider):
         """Create Cloud Scheduler job that triggers the drain workflow at cron time."""
         client = scheduler_v1.CloudSchedulerClient()
         parent = f"projects/{self.project_id}/locations/{self.location}"
-        job_id = f"lamia-trigger-{plan.name}-scheduler"
-        job_name = f"{parent}/jobs/{job_id}"
+        job_id = trigger_job_id(plan.name)
 
         workflow_path = (
             f"projects/{self.project_id}/locations/{self.location}"
             f"/workflows/{workflow_name}"
         )
 
-        sa_email = f"lamia-runner@{self.project_id}.iam.gserviceaccount.com"
-
-        http_target = scheduler_v1.HttpTarget(
-            uri=f"https://workflowexecutions.googleapis.com/v1/{workflow_path}/executions",
-            http_method=scheduler_v1.HttpMethod.POST,
-            body=b'{"argument":"{\\"source\\":\\"scheduler\\"}"}',
-            oauth_token=scheduler_v1.OAuthToken(
-                service_account_email=sa_email,
-                scope="https://www.googleapis.com/auth/cloud-platform",
+        job = build_scheduler_job(
+            name=f"{parent}/jobs/{job_id}",
+            project_id=self.project_id,
+            cron=plan.cron,
+            target_uri=(
+                f"https://workflowexecutions.googleapis.com/v1/{workflow_path}/executions"
             ),
-        )
-
-        job = scheduler_v1.Job(
-            name=job_name,
-            schedule=plan.cron,
-            time_zone="UTC",
-            http_target=http_target,
+            body=b'{"argument":"{\\"source\\":\\"scheduler\\"}"}',
             description=f"Lamia trigger drain: {plan.name}",
         )
 
@@ -637,7 +628,7 @@ class GCPTriggerProvider(CloudTriggerProvider):
         client = scheduler_v1.CloudSchedulerClient()
         job_name = (
             f"projects/{self.project_id}/locations/{self.location}"
-            f"/jobs/lamia-trigger-{name}-scheduler"
+            f"/jobs/{trigger_job_id(name)}"
         )
         try:
             client.delete_job(name=job_name)
