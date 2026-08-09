@@ -72,6 +72,11 @@ class CloudScheduler(ABC):
         ...
 
     @abstractmethod
+    def get_last_execution_status(self, job: CloudScheduleJob) -> Optional[dict]:
+        """Return last completed Cloud Run Job execution status, or None."""
+        ...
+
+    @abstractmethod
     def pause(self, job: CloudScheduleJob) -> None:
         """Pause a scheduled job (stops triggering without removing it)."""
         ...
@@ -79,6 +84,11 @@ class CloudScheduler(ABC):
     @abstractmethod
     def resume(self, job: CloudScheduleJob) -> None:
         """Resume a previously paused job."""
+        ...
+
+    @abstractmethod
+    def fetch_logs(self, job: CloudScheduleJob) -> dict:
+        """Fetch logs from the most recent execution. Returns {stdout, stderr, logs_url}."""
         ...
 
     @abstractmethod
@@ -173,6 +183,11 @@ class CloudTriggerProvider(ABC):
     @abstractmethod
     def from_config(cls, cloud_cfg: dict) -> "CloudTriggerProvider":
         """Create instance from config.yaml cloud section."""
+        ...
+
+    @abstractmethod
+    def fetch_logs(self, name: str) -> dict:
+        """Fetch logs from the most recent run. Returns {stdout, stderr, logs_url}."""
         ...
 
     @abstractmethod

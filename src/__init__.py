@@ -20,6 +20,8 @@ from lamia_cloud.types import (
 )
 from lamia_cloud.gcp import VertexLLM, is_on_gcp
 from lamia_cloud.loader import get_deployer, get_scheduler, get_trigger_provider
+from lamia_cloud.gcp.deployer import ensure_apis_enabled
+from lamia_cloud.loader import get_scheduler
 
 _llm_instance: CloudLLM = None
 
@@ -72,4 +74,5 @@ __all__ = [
     "get_scheduler",
     "get_trigger_provider",
     "is_on_cloud",
+    "ensure_apis_enabled",
 ]

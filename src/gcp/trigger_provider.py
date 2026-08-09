@@ -15,11 +15,12 @@ from pathlib import Path
 from typing import Optional
 
 from google.api_core.exceptions import AlreadyExists, NotFound
-from google.cloud import eventarc_v1, monitoring_v3, scheduler_v1, workflows_v1, pubsub_v1
+from google.cloud import eventarc_v1, monitoring_v3, run_v2, scheduler_v1, workflows_v1, pubsub_v1
 
 from lamia_cloud.interfaces import CloudTriggerProvider
 from lamia_cloud.types import TriggerDeploymentPlan, TriggerStage
-from lamia_cloud.gcp.deployer import deploy, teardown, deployment_name
+from lamia_cloud.gcp.deployer import deploy, fetch_latest_logs, teardown, deployment_name
+from lamia_cloud.gcp.scheduler_job import build_scheduler_job, trigger_job_id
 from lamia_cloud.gcp.workflow_generator import (
     generate_workflow_yaml,
     generate_drain_workflow_yaml,
@@ -204,6 +205,50 @@ class GCPTriggerProvider(CloudTriggerProvider):
         except Exception as e:
             logger.warning(f"Failed to list workflows: {e}")
         return deployments
+
+    def _stage_job_names(self, name: str) -> list[str]:
+        """Cloud Run Jobs backing a trigger, in stage order.
+
+        Single-stage triggers deploy one job named after the trigger; multi-stage
+        triggers append a -stage-N suffix per stage.
+        """
+        prefix = deployment_name(name)
+        client = run_v2.JobsClient()
+        parent = f"projects/{self.project_id}/locations/{self.location}"
+        job_names = []
+        for job in client.list_jobs(parent=parent):
+            short = job.name.split("/")[-1]
+            if short == prefix or short.startswith(f"{prefix}-stage-"):
+                job_names.append(short)
+        return sorted(job_names)
+
+    def fetch_logs(self, name: str) -> dict:
+        """Fetch logs from the most recent run, concatenated across stages."""
+        job_names = self._stage_job_names(name)
+        if not job_names:
+            raise ValueError(f"No deployed jobs found for trigger '{name}'")
+
+        stdout_parts = []
+        stderr_parts = []
+        logs_url = ""
+        for job_name in job_names:
+            try:
+                stdout, stderr, url = fetch_latest_logs(
+                    project_id=self.project_id,
+                    location=self.location,
+                    target=job_name,
+                )
+            except ValueError:
+                continue
+            stdout_parts.append(stdout)
+            stderr_parts.append(stderr)
+            logs_url = logs_url or url
+
+        return {
+            "stdout": "\n".join(p for p in stdout_parts if p),
+            "stderr": "\n".join(p for p in stderr_parts if p),
+            "logs_url": logs_url,
+        }
 
     def _stage_job_name(self, plan_name: str, stage_index: int, total_stages: int) -> str:
         if total_stages == 1:
@@ -553,31 +598,21 @@ class GCPTriggerProvider(CloudTriggerProvider):
         """Create Cloud Scheduler job that triggers the drain workflow at cron time."""
         client = scheduler_v1.CloudSchedulerClient()
         parent = f"projects/{self.project_id}/locations/{self.location}"
-        job_id = f"lamia-trigger-{plan.name}-scheduler"
-        job_name = f"{parent}/jobs/{job_id}"
+        job_id = trigger_job_id(plan.name)
 
         workflow_path = (
             f"projects/{self.project_id}/locations/{self.location}"
             f"/workflows/{workflow_name}"
         )
 
-        sa_email = f"lamia-runner@{self.project_id}.iam.gserviceaccount.com"
-
-        http_target = scheduler_v1.HttpTarget(
-            uri=f"https://workflowexecutions.googleapis.com/v1/{workflow_path}/executions",
-            http_method=scheduler_v1.HttpMethod.POST,
-            body=b'{"argument":"{\\"source\\":\\"scheduler\\"}"}',
-            oauth_token=scheduler_v1.OAuthToken(
-                service_account_email=sa_email,
-                scope="https://www.googleapis.com/auth/cloud-platform",
+        job = build_scheduler_job(
+            name=f"{parent}/jobs/{job_id}",
+            project_id=self.project_id,
+            cron=plan.cron,
+            target_uri=(
+                f"https://workflowexecutions.googleapis.com/v1/{workflow_path}/executions"
             ),
-        )
-
-        job = scheduler_v1.Job(
-            name=job_name,
-            schedule=plan.cron,
-            time_zone="UTC",
-            http_target=http_target,
+            body=b'{"argument":"{\\"source\\":\\"scheduler\\"}"}',
             description=f"Lamia trigger drain: {plan.name}",
         )
 
@@ -593,7 +628,7 @@ class GCPTriggerProvider(CloudTriggerProvider):
         client = scheduler_v1.CloudSchedulerClient()
         job_name = (
             f"projects/{self.project_id}/locations/{self.location}"
-            f"/jobs/lamia-trigger-{name}-scheduler"
+            f"/jobs/{trigger_job_id(name)}"
         )
         try:
             client.delete_job(name=job_name)

@@ -9,9 +9,20 @@ import logging
 import time
 from typing import Optional
 
+from google.cloud import run_v2
+
 from lamia_cloud.interfaces import CloudScheduler
 from lamia_cloud.types import CloudScheduleJob, CloudJobStatus
-from lamia_cloud.gcp.deployer import deploy, teardown, run_job, fetch_execution_logs, ensure_apis_enabled
+from lamia_cloud.gcp.deployer import (
+    deploy,
+    deployment_name,
+    ensure_apis_enabled,
+    fetch_execution_logs,
+    fetch_latest_logs,
+    run_job,
+    teardown,
+)
+from lamia_cloud.gcp.scheduler_job import build_scheduler_job, schedule_job_id
 
 logger = logging.getLogger(__name__)
 
@@ -45,38 +56,21 @@ class GCPCloudScheduler(CloudScheduler):
         return scheduler_v1.CloudSchedulerClient()
 
     def _scheduler_job_name(self, job: CloudScheduleJob) -> str:
-        return f"{self._parent}/jobs/lamia-{job.schedule_id}"
+        return f"{self._parent}/jobs/{schedule_job_id(job.schedule_id)}"
 
     def _build_scheduler_job(self, job: CloudScheduleJob, cr_job_name: str):
         """Build a Cloud Scheduler job that triggers a Cloud Run Job via the Run API."""
-        from google.cloud import scheduler_v1
-
-        schedule = job.cron
-        if schedule == "@reboot":
-            schedule = "0 * * * *"
-
         run_job_url = (
             f"https://{self.location}-run.googleapis.com/v2/"
             f"projects/{self.project_id}/locations/{self.location}/"
             f"jobs/{cr_job_name}:run"
         )
 
-        sa_email = f"lamia-runner@{self.project_id}.iam.gserviceaccount.com"
-
-        return scheduler_v1.Job(
+        return build_scheduler_job(
             name=self._scheduler_job_name(job),
-            schedule=schedule,
-            time_zone="UTC",
-            http_target=scheduler_v1.HttpTarget(
-                uri=run_job_url,
-                http_method=scheduler_v1.HttpMethod.POST,
-                headers={"Content-Type": "application/json"},
-                body=b"{}",
-                oauth_token=scheduler_v1.OAuthToken(
-                    service_account_email=sa_email,
-                    scope="https://www.googleapis.com/auth/cloud-platform",
-                ),
-            ),
+            project_id=self.project_id,
+            cron=job.cron,
+            target_uri=run_job_url,
         )
 
     def install(self, job: CloudScheduleJob, lamia_bin: str) -> None:
@@ -179,6 +173,45 @@ class GCPCloudScheduler(CloudScheduler):
             }
         except Exception:
             return None
+
+    def get_last_execution_status(self, job: CloudScheduleJob) -> Optional[dict]:
+        """Return the last completed Cloud Run Job execution status, or None."""
+        client = run_v2.ExecutionsClient()
+        cr_job_name = deployment_name(job.schedule_id)
+        parent = f"projects/{self.project_id}/locations/{self.location}/jobs/{cr_job_name}"
+
+        latest = None
+        try:
+            for execution in client.list_executions(parent=parent):
+                if not execution.completion_time:
+                    continue
+                if latest is None or execution.completion_time > latest.completion_time:
+                    latest = execution
+        except Exception:
+            return None
+
+        if latest is None:
+            return None
+
+        exit_code = 0 if latest.succeeded_count > 0 else 1
+        return {
+            "timestamp": latest.completion_time.isoformat(),
+            "success": latest.succeeded_count > 0,
+            "exit_code": exit_code,
+        }
+
+    def fetch_logs(self, job: CloudScheduleJob) -> dict:
+        """Fetch logs from the most recent execution.
+
+        Returns {stdout, stderr, logs_url}.
+        """
+        cr_job_name = deployment_name(job.schedule_id)
+        stdout, stderr, logs_url = fetch_latest_logs(
+            project_id=self.project_id,
+            location=self.location,
+            target=cr_job_name,
+        )
+        return {"stdout": stdout, "stderr": stderr, "logs_url": logs_url}
 
     def run_once(self, job: CloudScheduleJob, verbose: bool = False) -> dict:
         """Deploy and invoke once without scheduling."""

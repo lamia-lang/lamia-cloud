@@ -334,6 +334,12 @@ the build step is skipped.
 2. Cloud Scheduler calls `jobs.run` on the Cloud Run Job at cron time.
 3. `lamia schedule list` with `--remote` queries Scheduler + Job state.
 
+Both scheduled scripts and scheduled-mode triggers are driven by a Cloud
+Scheduler job that POSTs JSON to a Google API as the runner service account.
+`scheduler_job.py` builds that job for both; callers supply the target URI and
+body, which is all that differs between them. `@reboot` is not a valid Cloud
+Scheduler expression and is normalized to hourly there.
+
 ---
 
 ## LLM Routing (Vertex AI)
@@ -354,6 +360,7 @@ src/gcp/
 ├── __init__.py             ← exports GCPCloudScheduler, GCPTriggerProvider, VertexLLM
 ├── deployer.py             ← Cloud Build + Cloud Run Job deployment
 ├── scheduler.py            ← Cloud Scheduler integration
+├── scheduler_job.py        ← Cloud Scheduler job construction (shared by scheduler + triggers)
 ├── trigger_provider.py     ← Trigger orchestration (Eventarc, Workflows, Pub/Sub)
 ├── workflow_generator.py   ← YAML generation for Workflows (reactive + drain)
 └── vertex.py               ← Vertex AI LLM routing
