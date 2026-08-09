@@ -1,10 +1,12 @@
 """Cloud interfaces — the public API of lamia-cloud.
 
 These abstract base classes are what external consumers (e.g., lamia's cloud
-adapter) implement against. Three separate abstractions: CloudLLM (text
-generation), CloudScheduler (remote jobs), and CloudTriggerProvider (event-driven).
+adapter) implement against. Four abstractions: CloudLLM (text generation),
+CloudScheduler (remote jobs), CloudDeployer (build/deploy/run pipeline),
+and CloudTriggerProvider (event-driven triggers).
 """
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import List, Optional
 
 from lamia_cloud.types import (
@@ -82,6 +84,81 @@ class CloudScheduler(ABC):
     @abstractmethod
     def run_once(self, job: CloudScheduleJob, verbose: bool = False) -> dict:
         """Deploy and invoke once without scheduling. Returns {exit_code, stdout, stderr, logs_url}."""
+        ...
+
+
+class CloudDeployer(ABC):
+    """Abstract deployer for building, deploying, and running .lm scripts in the cloud.
+
+    Encapsulates the full lifecycle: API enablement, container build,
+    Cloud Run Job deployment, execution, and log retrieval.
+    Implementations hold provider credentials (project_id, etc.) as instance state.
+    """
+
+    @classmethod
+    @abstractmethod
+    def from_config(cls, cloud_cfg: dict) -> "CloudDeployer":
+        """Create instance from config.yaml cloud section."""
+        ...
+
+    @abstractmethod
+    def ensure_apis_enabled(self) -> None:
+        """Enable all cloud APIs required by this provider."""
+        ...
+
+    @abstractmethod
+    def deployment_name(self, name: str) -> str:
+        """Return the provider-specific resource name for a deployment."""
+        ...
+
+    @abstractmethod
+    def collect_project_files(self, project_root: Path) -> list[Path]:
+        """Collect deployable files from the project directory."""
+        ...
+
+    @abstractmethod
+    def get_deployed_source_hash(self, target: str) -> Optional[str]:
+        """Read the source hash stored on a deployed resource."""
+        ...
+
+    @abstractmethod
+    def set_deployed_source_hash(self, target: str, hash_val: str) -> None:
+        """Store a source hash on a deployed resource."""
+        ...
+
+    @abstractmethod
+    def sync_runtime_files(self, entries: list) -> dict:
+        """Sync local file references to cloud storage for runtime access."""
+        ...
+
+    @abstractmethod
+    def deploy(
+        self,
+        project_root: Path,
+        script_name: str,
+        name: str,
+        capabilities: Optional[dict] = None,
+        uses_files: bool = False,
+    ) -> str:
+        """Full deploy pipeline: package, build, deploy. Returns deployment name."""
+        ...
+
+    @abstractmethod
+    def run_job(self, target: str, verbose: bool = False) -> dict:
+        """Execute a deployed job and wait for completion.
+
+        Returns dict with at least: exit_code, elapsed_seconds, logs_url, execution_name.
+        """
+        ...
+
+    @abstractmethod
+    def fetch_execution_logs(self, target: str, execution_name: str = "") -> tuple[str, str]:
+        """Retrieve stdout and stderr from a completed execution."""
+        ...
+
+    @abstractmethod
+    def teardown(self, name: str) -> None:
+        """Remove a deployed resource."""
         ...
 
 

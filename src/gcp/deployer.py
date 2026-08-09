@@ -35,6 +35,38 @@ logger = logging.getLogger(__name__)
 TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 FILES_MOUNT_PATH = "/mnt/lamia-files"
 
+REQUIRED_APIS = (
+    "serviceusage.googleapis.com",
+    "cloudscheduler.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "run.googleapis.com",
+    "storage.googleapis.com",
+    "aiplatform.googleapis.com",
+    "iam.googleapis.com",
+    "logging.googleapis.com",
+)
+
+
+def ensure_apis_enabled(project_id: str) -> None:
+    """Enable all GCP APIs required by lamia-cloud."""
+    try:
+        from google.cloud import service_usage_v1
+        client = service_usage_v1.ServiceUsageClient()
+        for api in REQUIRED_APIS:
+            service_name = f"projects/{project_id}/services/{api}"
+            try:
+                client.enable_service(request={"name": service_name})
+            except Exception as e:
+                if "SERVICE_DISABLED" in str(e) and "serviceusage" in api:
+                    logger.warning(
+                        f"Service Usage API not enabled. Run once:\n"
+                        f"  gcloud services enable serviceusage.googleapis.com "
+                        f"--project={project_id}"
+                    )
+                    return
+    except ImportError:
+        pass
+
 
 def compute_resource_tier(
     uses_llm: bool = False,
@@ -699,3 +731,84 @@ def teardown(project_id: str, location: str, name: str) -> None:
     except Exception as e:
         if "NOT_FOUND" not in str(e):
             raise
+
+
+# ---------------------------------------------------------------------------
+# CloudDeployer implementation (wraps the module-level functions above)
+# ---------------------------------------------------------------------------
+
+from lamia_cloud.interfaces import CloudDeployer
+
+
+class GCPDeployer(CloudDeployer):
+    """GCP implementation of CloudDeployer using Cloud Build + Cloud Run Jobs."""
+
+    def __init__(self, *, project_id: str, location: str):
+        self.project_id = project_id
+        self.location = location
+
+    @classmethod
+    def from_config(cls, cloud_cfg: dict) -> "GCPDeployer":
+        project_id = cloud_cfg.get("project_id")
+        if not project_id:
+            raise ValueError("cloud.project_id is required in config.yaml.")
+        location = cloud_cfg.get("location", "us-central1")
+        return cls(project_id=project_id, location=location)
+
+    def ensure_apis_enabled(self) -> None:
+        ensure_apis_enabled(self.project_id)
+
+    def deployment_name(self, name: str) -> str:
+        return deployment_name(name)
+
+    def collect_project_files(self, project_root: Path) -> list[Path]:
+        return collect_project_files(project_root)
+
+    def get_deployed_source_hash(self, target: str) -> Optional[str]:
+        return get_deployed_source_hash(self.project_id, self.location, target)
+
+    def set_deployed_source_hash(self, target: str, hash_val: str) -> None:
+        set_deployed_source_hash(self.project_id, self.location, target, hash_val)
+
+    def sync_runtime_files(self, entries: list) -> dict:
+        return sync_runtime_files(
+            project_id=self.project_id,
+            location=self.location,
+            entries=entries,
+        )
+
+    def deploy(
+        self,
+        project_root: Path,
+        script_name: str,
+        name: str,
+        capabilities=None,
+        uses_files: bool = False,
+    ) -> str:
+        return deploy(
+            project_id=self.project_id,
+            location=self.location,
+            project_root=project_root,
+            script_name=script_name,
+            name=name,
+            capabilities=capabilities,
+            uses_files=uses_files,
+        )
+
+    def run_job(self, target: str, verbose: bool = False) -> dict:
+        return run_job(
+            project_id=self.project_id,
+            location=self.location,
+            target=target,
+            verbose=verbose,
+        )
+
+    def fetch_execution_logs(self, target: str, execution_name: str = "") -> tuple[str, str]:
+        return fetch_execution_logs(
+            project_id=self.project_id,
+            target=target,
+            execution_name=execution_name,
+        )
+
+    def teardown(self, name: str) -> None:
+        teardown(self.project_id, self.location, name)
