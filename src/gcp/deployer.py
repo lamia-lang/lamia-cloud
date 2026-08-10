@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 FILES_MOUNT_PATH = "/mnt/lamia-files"
 
-REQUIRED_APIS = (
+_REQUIRED_GCP_APIS = (
     "serviceusage.googleapis.com",
     "cloudscheduler.googleapis.com",
     "cloudbuild.googleapis.com",
@@ -57,23 +57,19 @@ REQUIRED_APIS = (
 
 def ensure_apis_enabled(project_id: str) -> None:
     """Enable all GCP APIs required by lamia-cloud."""
-    try:
-        from google.cloud import service_usage_v1
-        client = service_usage_v1.ServiceUsageClient()
-        for api in REQUIRED_APIS:
-            service_name = f"projects/{project_id}/services/{api}"
-            try:
-                client.enable_service(request={"name": service_name})
-            except Exception as e:
-                if "SERVICE_DISABLED" in str(e) and "serviceusage" in api:
-                    logger.warning(
-                        f"Service Usage API not enabled. Run once:\n"
-                        f"  gcloud services enable serviceusage.googleapis.com "
-                        f"--project={project_id}"
-                    )
-                    return
-    except ImportError:
-        pass
+    client = service_usage_v1.ServiceUsageClient()
+    for api in _REQUIRED_GCP_APIS:
+        service_name = f"projects/{project_id}/services/{api}"
+        try:
+            client.enable_service(request={"name": service_name})
+        except Exception as e:
+            if "SERVICE_DISABLED" in str(e) and "serviceusage" in api:
+                logger.warning(
+                    f"Service Usage API not enabled. Run once:\n"
+                    f"  gcloud services enable serviceusage.googleapis.com "
+                    f"--project={project_id}"
+                )
+                return
 
 
 def compute_resource_tier(

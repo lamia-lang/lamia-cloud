@@ -27,6 +27,11 @@ from lamia_cloud.gcp.scheduler_job import build_scheduler_job, schedule_job_id
 logger = logging.getLogger(__name__)
 
 
+def _enable_apis(project_id: str) -> None:
+    """Backward-compatible wrapper around API enablement."""
+    ensure_apis_enabled(project_id)
+
+
 class GCPCloudScheduler(CloudScheduler):
     """GCP Cloud Scheduler backend with Cloud Run Jobs."""
 
@@ -48,7 +53,7 @@ class GCPCloudScheduler(CloudScheduler):
 
         location = cloud_cfg.get("location", "us-central1")
 
-        ensure_apis_enabled(project_id)
+        _enable_apis(project_id)
         return cls(project_id=project_id, location=location)
 
     def _scheduler_client(self):
