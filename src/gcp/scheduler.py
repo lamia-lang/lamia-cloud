@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 def _enable_apis(project_id: str) -> None:
-    """Enable all required GCP APIs automatically."""
+    """Backward-compatible wrapper around API enablement."""
     ensure_apis_enabled(project_id)
 
 

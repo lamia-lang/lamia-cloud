@@ -3,11 +3,13 @@
 Public API:
     get_cloud_llm() -> CloudLLM
     get_scheduler(project_root) -> CloudScheduler
+    get_deployer(project_root) -> CloudDeployer
+    get_trigger_provider(project_root) -> CloudTriggerProvider
     is_on_cloud() -> bool
     Types: CloudLLMRequest, CloudLLMResponse, CloudScheduleJob, CloudJobStatus,
            TriggerStage, TriggerDeploymentPlan
 """
-from lamia_cloud.interfaces import CloudLLM, CloudScheduler, CloudTriggerProvider
+from lamia_cloud.interfaces import CloudDeployer, CloudLLM, CloudScheduler, CloudTriggerProvider
 from lamia_cloud.types import (
     CloudLLMRequest,
     CloudLLMResponse,
@@ -17,6 +19,7 @@ from lamia_cloud.types import (
     TriggerDeploymentPlan,
 )
 from lamia_cloud.gcp import VertexLLM, is_on_gcp
+from lamia_cloud.loader import get_deployer, get_scheduler, get_trigger_provider
 from lamia_cloud.gcp.deployer import ensure_apis_enabled
 from lamia_cloud.loader import get_scheduler
 
@@ -56,6 +59,7 @@ def is_on_cloud() -> bool:
 
 
 __all__ = [
+    "CloudDeployer",
     "CloudLLM",
     "CloudScheduler",
     "CloudTriggerProvider",
@@ -66,7 +70,9 @@ __all__ = [
     "TriggerStage",
     "TriggerDeploymentPlan",
     "get_cloud_llm",
+    "get_deployer",
     "get_scheduler",
+    "get_trigger_provider",
     "is_on_cloud",
     "ensure_apis_enabled",
 ]
