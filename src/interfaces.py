@@ -149,6 +149,8 @@ class CloudDeployer(ABC):
         name: str,
         capabilities: Optional[dict] = None,
         uses_files: bool = False,
+        deploy_mode: str = "local",
+        repo_url: Optional[str] = None,
     ) -> str:
         """Full deploy pipeline: package, build, deploy. Returns deployment name."""
         ...
@@ -169,6 +171,20 @@ class CloudDeployer(ABC):
     @abstractmethod
     def teardown(self, name: str) -> None:
         """Remove a deployed resource."""
+        ...
+
+    @abstractmethod
+    def list_managed_jobs(self) -> list:
+        """List all cloud resources managed by lamia."""
+        ...
+
+    @abstractmethod
+    def cleanup_stale_resources(self, max_age_days: int = 30) -> list:
+        """Delete resources inactive for more than max_age_days.
+
+        Skips resources referenced by active schedules or triggers.
+        Returns list of cleaned-up resource names.
+        """
         ...
 
 

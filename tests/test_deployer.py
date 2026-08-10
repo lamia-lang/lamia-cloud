@@ -345,6 +345,84 @@ class TestIncrementalFileSync:
 
 
 class TestRunJob:
+    def test_run_job_updates_last_used_when_stale(self, monkeypatch):
+        from google.cloud import run_v2
+        from google.protobuf import timestamp_pb2
+
+        execution = run_v2.Execution(
+            name="projects/p/locations/us-central1/jobs/lamia-test/executions/exec-ok",
+            succeeded_count=1,
+            start_time=timestamp_pb2.Timestamp(seconds=200, nanos=0),
+            completion_time=timestamp_pb2.Timestamp(seconds=205, nanos=0),
+        )
+
+        job_obj = type("JobObj", (), {"labels": {"lamia-last-used": "20240101"}})()
+
+        class FakeOperation:
+            def result(self):
+                return execution
+
+        class FakeClient:
+            def __init__(self):
+                self.updated = 0
+
+            def get_job(self, request):
+                return job_obj
+
+            def update_job(self, job):
+                self.updated += 1
+                return None
+
+            def run_job(self, request):
+                return FakeOperation()
+
+        fake_client = FakeClient()
+        monkeypatch.setattr(deployer_module.run_v2, "JobsClient", lambda: fake_client)
+
+        result = run_job("p", "us-central1", "lamia-test")
+        assert result["exit_code"] == 0
+        assert fake_client.updated == 1
+        assert len(job_obj.labels["lamia-last-used"]) == 8
+
+    def test_run_job_does_not_update_last_used_when_already_today(self, monkeypatch):
+        from google.cloud import run_v2
+        from google.protobuf import timestamp_pb2
+
+        execution = run_v2.Execution(
+            name="projects/p/locations/us-central1/jobs/lamia-test/executions/exec-ok",
+            succeeded_count=1,
+            start_time=timestamp_pb2.Timestamp(seconds=200, nanos=0),
+            completion_time=timestamp_pb2.Timestamp(seconds=205, nanos=0),
+        )
+
+        today = deployer_module._today_label()
+        job_obj = type("JobObj", (), {"labels": {"lamia-last-used": today}})()
+
+        class FakeOperation:
+            def result(self):
+                return execution
+
+        class FakeClient:
+            def __init__(self):
+                self.updated = 0
+
+            def get_job(self, request):
+                return job_obj
+
+            def update_job(self, job):
+                self.updated += 1
+                return None
+
+            def run_job(self, request):
+                return FakeOperation()
+
+        fake_client = FakeClient()
+        monkeypatch.setattr(deployer_module.run_v2, "JobsClient", lambda: fake_client)
+
+        result = run_job("p", "us-central1", "lamia-test")
+        assert result["exit_code"] == 0
+        assert fake_client.updated == 0
+
     def test_run_job_returns_failure_on_aborted(self, monkeypatch):
         from google.api_core.exceptions import Aborted
         from google.cloud import run_v2

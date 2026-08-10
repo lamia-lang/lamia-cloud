@@ -11,6 +11,7 @@ LLM authentication uses Vertex AI — the Cloud Run Job service account gets
 roles/aiplatform.user, so no API keys are needed at runtime.
 """
 
+import hashlib
 import io
 import logging
 import shutil
@@ -19,6 +20,7 @@ import tempfile
 import time
 import urllib.parse
 from collections.abc import Mapping
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -35,7 +37,18 @@ from google.cloud import (
 from google.cloud.devtools import cloudbuild_v1
 from google.iam.v1 import policy_pb2
 
-from lamia_cloud.contracts import SCRIPT_CAPABILITY_FIELDS, SOURCE_HASH_LABEL
+from lamia_cloud.contracts import (
+    LABEL_DEPLOY_MODE,
+    LABEL_LAST_USED,
+    LABEL_MANAGED,
+    LABEL_PROJECT_HASH,
+    LABEL_RESOURCE_TYPE,
+    LABEL_SCRIPT,
+    SCRIPT_CAPABILITY_FIELDS,
+    SOURCE_HASH_LABEL,
+    STALE_RESOURCE_DAYS,
+    sanitize_label_value,
+)
 from lamia_cloud.file_sync import file_sha256
 
 logger = logging.getLogger(__name__)
@@ -53,6 +66,51 @@ _REQUIRED_GCP_APIS = (
     "iam.googleapis.com",
     "logging.googleapis.com",
 )
+
+
+def _today_label() -> str:
+    """Return today's date as a GCP-label-safe string: YYYYMMDD."""
+    return date.today().strftime("%Y%m%d")
+
+
+def _project_hash(project_root: Path) -> str:
+    """8-char hex hash of the project root path for label identification."""
+    return hashlib.sha256(str(project_root).encode()).hexdigest()[:8]
+
+
+def build_resource_labels(
+    script_name: str,
+    project_root: Path,
+    deploy_mode: str = "local",
+    repo_url: str | None = None,
+) -> dict[str, str]:
+    """Build the full set of lamia metadata labels for a Cloud Run Job."""
+    labels = {
+        LABEL_MANAGED: "true",
+        LABEL_SCRIPT: sanitize_label_value(script_name),
+        LABEL_PROJECT_HASH: _project_hash(project_root),
+        LABEL_LAST_USED: _today_label(),
+        LABEL_DEPLOY_MODE: deploy_mode,
+        LABEL_RESOURCE_TYPE: "one-shot",
+    }
+    if repo_url:
+        labels["lamia-repo-url"] = sanitize_label_value(repo_url)
+    return labels
+
+
+def _touch_last_used(client, project_id: str, location: str, target: str) -> None:
+    """Update the lamia-last-used label on a Cloud Run Job to today."""
+    try:
+        resource = f"projects/{project_id}/locations/{location}/jobs/{target}"
+        job = client.get_job(request={"name": resource})
+        if job.labels is None:
+            job.labels = {}
+        today = _today_label()
+        if job.labels.get(LABEL_LAST_USED) != today:
+            job.labels[LABEL_LAST_USED] = today
+            client.update_job(job=job)
+    except Exception as exc:
+        logger.warning(f"Failed to update {LABEL_LAST_USED} for {target}: {exc}")
 
 
 def ensure_apis_enabled(project_id: str) -> None:
@@ -399,10 +457,12 @@ def deploy_job(
     memory: str = "512Mi",
     cpu: str = "1",
     files_bucket: Optional[str] = None,
+    extra_labels: dict[str, str] | None = None,
 ) -> None:
     """Deploy (or update) a Cloud Run Job.
 
     The job runs the lamia CLI directly — no HTTP handler.
+    ``extra_labels`` are merged with the default ``lamia-managed`` label.
     """
     client = run_v2.JobsClient()
     parent = f"projects/{project_id}/locations/{location}"
@@ -439,6 +499,10 @@ def deploy_job(
             )
         ]
 
+    merged_labels = {LABEL_MANAGED: "true"}
+    if extra_labels:
+        merged_labels.update(extra_labels)
+
     job = run_v2.Job(
         template=run_v2.ExecutionTemplate(
             template=run_v2.TaskTemplate(
@@ -449,7 +513,7 @@ def deploy_job(
                 timeout={"seconds": 3600},
             ),
         ),
-        labels={"lamia-managed": "true"},
+        labels=merged_labels,
     )
 
     try:
@@ -518,6 +582,8 @@ def run_job(
     """
     client = run_v2.JobsClient()
     name = f"projects/{project_id}/locations/{location}/jobs/{target}"
+
+    _touch_last_used(client, project_id, location, target)
 
     overrides = None
     if verbose:
@@ -723,6 +789,8 @@ def deploy(
     name: str,
     capabilities=None,
     uses_files: bool = False,
+    deploy_mode: str = "local",
+    repo_url: str | None = None,
 ) -> str:
     """Full deploy pipeline. Returns the deployment name.
 
@@ -773,6 +841,11 @@ def deploy(
         if uses_files:
             files_bucket = ensure_files_bucket(project_id, location)
 
+        resource_labels = build_resource_labels(
+            script_name, project_root,
+            deploy_mode=deploy_mode, repo_url=repo_url,
+        )
+
         logger.info(f"Deploying Cloud Run Job ({memory}, {cpu} vCPU)...")
         deploy_job(
             project_id,
@@ -783,6 +856,7 @@ def deploy(
             memory=memory,
             cpu=cpu,
             files_bucket=files_bucket,
+            extra_labels=resource_labels,
         )
 
         return job_name
@@ -804,6 +878,95 @@ def teardown(project_id: str, location: str, name: str) -> None:
     except Exception as e:
         if "NOT_FOUND" not in str(e):
             raise
+
+
+def list_managed_jobs(project_id: str, location: str) -> list[dict]:
+    """List all Cloud Run Jobs with the lamia-managed label.
+
+    Returns a list of dicts with keys: name, labels, create_time, update_time.
+    """
+    client = run_v2.JobsClient()
+    parent = f"projects/{project_id}/locations/{location}"
+    results = []
+    for job in client.list_jobs(parent=parent):
+        if (job.labels or {}).get(LABEL_MANAGED) == "true":
+            results.append({
+                "name": job.name.rsplit("/", 1)[-1],
+                "full_name": job.name,
+                "labels": dict(job.labels or {}),
+                "create_time": job.create_time,
+                "update_time": job.update_time,
+            })
+    return results
+
+
+def _referenced_job_names(project_id: str, location: str) -> set[str] | None:
+    """Collect Cloud Run Job names referenced by active Cloud Scheduler jobs.
+
+    Returns None when the Cloud Scheduler API cannot be queried — callers
+    must treat None as "unknown" and skip any deletions.
+    """
+    try:
+        from google.cloud import scheduler_v1
+        client = scheduler_v1.CloudSchedulerClient()
+        parent = f"projects/{project_id}/locations/{location}"
+        referenced: set[str] = set()
+        for sched_job in client.list_jobs(parent=parent):
+            target = getattr(sched_job, "http_target", None)
+            if target and target.uri:
+                for part in target.uri.split("/"):
+                    if part.startswith("lamia-"):
+                        referenced.add(part)
+                        break
+        return referenced
+    except Exception:
+        logger.warning("Cloud Scheduler API unreachable — skipping reference check")
+        return None
+
+
+def cleanup_stale_resources(
+    project_id: str,
+    location: str,
+    max_age_days: int = STALE_RESOURCE_DAYS,
+) -> list[str]:
+    """Delete Cloud Run Jobs inactive for more than max_age_days.
+
+    Skips jobs referenced by Cloud Scheduler or trigger workflows.
+    Returns list of cleaned-up job names.
+    """
+    cutoff = date.today() - timedelta(days=max_age_days)
+    managed = list_managed_jobs(project_id, location)
+    referenced = _referenced_job_names(project_id, location)
+
+    if referenced is None:
+        return []
+
+    cleaned = []
+    client = run_v2.JobsClient()
+    for job in managed:
+        if job["name"] in referenced:
+            continue
+        if job["labels"].get(LABEL_RESOURCE_TYPE, "") != "one-shot":
+            continue
+        last_used_raw = job["labels"].get(LABEL_LAST_USED, "")
+        if not last_used_raw:
+            continue
+        try:
+            last_used = datetime.strptime(last_used_raw, "%Y%m%d").date()
+        except ValueError:
+            logger.warning(
+                f"Skipping cleanup for {job['name']}: invalid {LABEL_LAST_USED}={last_used_raw!r}"
+            )
+            continue
+        if last_used <= cutoff:
+            try:
+                client.delete_job(name=job["full_name"])
+                age = (date.today() - last_used).days
+                logger.info(f"Cleaned up stale resource: {job['name']} (unused for {age} days)")
+                cleaned.append(job["name"])
+            except Exception as exc:
+                logger.warning(f"Failed to clean up {job['name']}: {exc}")
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -857,6 +1020,8 @@ class GCPDeployer(CloudDeployer):
         name: str,
         capabilities=None,
         uses_files: bool = False,
+        deploy_mode: str = "local",
+        repo_url: str | None = None,
     ) -> str:
         return deploy(
             project_id=self.project_id,
@@ -866,6 +1031,8 @@ class GCPDeployer(CloudDeployer):
             name=name,
             capabilities=capabilities,
             uses_files=uses_files,
+            deploy_mode=deploy_mode,
+            repo_url=repo_url,
         )
 
     def run_job(self, target: str, verbose: bool = False) -> dict:
@@ -885,3 +1052,9 @@ class GCPDeployer(CloudDeployer):
 
     def teardown(self, name: str) -> None:
         teardown(self.project_id, self.location, name)
+
+    def list_managed_jobs(self) -> list[dict]:
+        return list_managed_jobs(self.project_id, self.location)
+
+    def cleanup_stale_resources(self, max_age_days: int = STALE_RESOURCE_DAYS) -> list[str]:
+        return cleanup_stale_resources(self.project_id, self.location, max_age_days=max_age_days)
