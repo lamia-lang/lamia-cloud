@@ -69,9 +69,15 @@ class TriggerDeploymentPlan:
     mode:
         "reactive" -- Eventarc directly invokes workflow on each event (always-on).
         "scheduled" -- Events accumulate in a queue; a scheduler drains them at cron time.
+
+    script_name:
+        The actual source file name (e.g. "pricing_reply.lm"). Used for
+        the LAMIA_SCRIPT env var and metadata labels. When None, falls
+        back to ``name + ".lm"`` for backward compatibility.
     """
     name: str
     stages: List[TriggerStage] = field(default_factory=list)
     capabilities: dict = field(default_factory=dict)
     mode: str = "reactive"
     cron: Optional[str] = None
+    script_name: Optional[str] = None

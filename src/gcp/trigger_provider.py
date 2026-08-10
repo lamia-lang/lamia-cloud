@@ -105,7 +105,21 @@ class GCPTriggerProvider(CloudTriggerProvider):
         return cls(project_id=project_id, location=location)
 
     def deploy(self, plan: TriggerDeploymentPlan) -> str:
-        """Deploy trigger infrastructure based on plan mode."""
+        """Deploy trigger infrastructure based on plan mode.
+
+        Idempotent: deterministic plan names ensure the same script always
+        maps to the same cloud resources.  GCP create calls that hit
+        AlreadyExists fall through to update.
+        """
+        from lamia_cloud.contracts import sanitize_label_value
+        self._current_workflow_labels = {
+            "lamia-managed": "true",
+        }
+        if plan.script_name:
+            self._current_workflow_labels["lamia-script"] = sanitize_label_value(
+                plan.script_name
+            )
+
         if plan.mode == "scheduled":
             return self._deploy_scheduled(plan)
         return self._deploy_reactive(plan)
@@ -113,6 +127,7 @@ class GCPTriggerProvider(CloudTriggerProvider):
     def _deploy_reactive(self, plan: TriggerDeploymentPlan) -> str:
         """Reactive mode: Eventarc -> Workflow -> Job per event."""
         total_stages = len(plan.stages)
+        actual_script = plan.script_name or f"{plan.name}.lm"
 
         for stage in plan.stages:
             job_name = self._stage_job_name(plan.name, stage.stage_index, total_stages)
@@ -121,7 +136,7 @@ class GCPTriggerProvider(CloudTriggerProvider):
                 project_id=self.project_id,
                 location=self.location,
                 project_root=Path.cwd(),
-                script_name=f"{plan.name}.lm",
+                script_name=actual_script,
                 name=job_name,
                 capabilities=plan.capabilities or None,
             )
@@ -142,6 +157,7 @@ class GCPTriggerProvider(CloudTriggerProvider):
     def _deploy_scheduled(self, plan: TriggerDeploymentPlan) -> str:
         """Scheduled mode: events -> Pub/Sub accumulation, Scheduler -> drain workflow."""
         total_stages = len(plan.stages)
+        actual_script = plan.script_name or f"{plan.name}.lm"
 
         for stage in plan.stages:
             job_name = self._stage_job_name(plan.name, stage.stage_index, total_stages)
@@ -150,7 +166,7 @@ class GCPTriggerProvider(CloudTriggerProvider):
                 project_id=self.project_id,
                 location=self.location,
                 project_root=Path.cwd(),
-                script_name=f"{plan.name}.lm",
+                script_name=actual_script,
                 name=job_name,
                 capabilities=plan.capabilities or None,
             )
@@ -192,14 +208,18 @@ class GCPTriggerProvider(CloudTriggerProvider):
             for wf in client.list_workflows(parent=parent):
                 if wf.name.split("/")[-1].startswith("lamia-trigger-"):
                     trigger_name = wf.name.split("/")[-1].replace("lamia-trigger-", "")
+                    labels = wf.labels or {}
+                    script = labels.get("lamia-script", "")
+                    if not script:
+                        script = f"{trigger_name.replace('-', '_')}.lm"
                     failed_count = self._get_failed_event_count(trigger_name)
                     deployments.append({
                         "name": trigger_name,
-                        "script": f"{trigger_name.replace('-', '_')}.lm",
-                        "trigger_method": (wf.labels or {}).get("trigger-method", ""),
-                        "mode": (wf.labels or {}).get("trigger-mode", "reactive"),
-                        "last_run": (wf.labels or {}).get("last-run", "never"),
-                        "last_status": (wf.labels or {}).get("last-status", "unknown"),
+                        "script": script,
+                        "trigger_method": labels.get("trigger-method", ""),
+                        "mode": labels.get("trigger-mode", "reactive"),
+                        "last_run": labels.get("last-run", "never"),
+                        "last_status": labels.get("last-status", "unknown"),
                         "failed_event_count": failed_count,
                     })
         except Exception as e:
@@ -263,7 +283,7 @@ class GCPTriggerProvider(CloudTriggerProvider):
         workflow = workflows_v1.Workflow(
             name=full_name,
             source_contents=source,
-            labels={"lamia-managed": "true"},
+            labels=self._current_workflow_labels,
         )
 
         try:
