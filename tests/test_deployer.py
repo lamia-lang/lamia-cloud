@@ -106,6 +106,101 @@ class TestPackageDeployment:
         assert "lamia /app/project/${LAMIA_SCRIPT}" in content
 
 
+class TestPackageDeploymentGitMode:
+    """Git mode: tarball contains only Dockerfile + requirements.txt, no project files."""
+
+    def test_git_mode_no_project_directory(self, tmp_path):
+        (tmp_path / "hello.lm").write_text('print("hi")')
+
+        staging = package_deployment(
+            tmp_path, "hello.lm", "abc123", deploy_mode="git",
+        )
+
+        assert (staging / "Dockerfile").exists()
+        assert (staging / "requirements.txt").exists()
+        assert not (staging / "project").exists()
+
+    def test_git_mode_dockerfile_identical_to_local(self, tmp_path):
+        (tmp_path / "hello.lm").write_text('print("hi")')
+
+        local_staging = package_deployment(tmp_path, "hello.lm", "abc1")
+        git_staging = package_deployment(
+            tmp_path, "hello.lm", "abc2", deploy_mode="git",
+        )
+
+        local_df = (local_staging / "Dockerfile").read_text()
+        git_df = (git_staging / "Dockerfile").read_text()
+        assert local_df == git_df
+
+    def test_git_mode_requirements_same_as_local(self, tmp_path):
+        (tmp_path / "hello.lm").write_text('print("hi")')
+        (tmp_path / "requirements.txt").write_text("requests>=2.0\n")
+
+        local_staging = package_deployment(tmp_path, "hello.lm", "a1")
+        git_staging = package_deployment(
+            tmp_path, "hello.lm", "a2", deploy_mode="git",
+        )
+
+        assert (local_staging / "requirements.txt").read_text() == \
+               (git_staging / "requirements.txt").read_text()
+
+    def test_git_mode_tarball_is_smaller(self, tmp_path):
+        (tmp_path / "hello.lm").write_text('print("hi")')
+        (tmp_path / "big_data.json").write_text("{}" * 10000)
+
+        local_staging = package_deployment(tmp_path, "hello.lm", "a1")
+        git_staging = package_deployment(
+            tmp_path, "hello.lm", "a2", deploy_mode="git",
+        )
+
+        local_tarball = create_source_tarball(local_staging)
+        git_tarball = create_source_tarball(git_staging)
+        assert len(git_tarball) < len(local_tarball)
+
+
+class TestSubmitBuildGitMode:
+    """submit_build() adds a git clone step when repo_url is provided."""
+
+    @patch("lamia_cloud.gcp.deployer.cloudbuild_v1")
+    def test_local_mode_single_docker_step(self, mock_cb):
+        mock_client = MagicMock()
+        mock_cb.CloudBuildClient.return_value = mock_client
+        op = MagicMock()
+        op.result.return_value = MagicMock(
+            status=mock_cb.Build.Status.SUCCESS,
+        )
+        mock_client.create_build.return_value = op
+
+        from lamia_cloud.gcp.deployer import submit_build
+        submit_build("proj", "gs://bucket/src.tar.gz", "img:latest")
+
+        step_calls = mock_cb.BuildStep.call_args_list
+        assert len(step_calls) == 1
+        assert step_calls[0].kwargs["name"] == "gcr.io/cloud-builders/docker"
+
+    @patch("lamia_cloud.gcp.deployer.cloudbuild_v1")
+    def test_git_mode_prepends_clone_step(self, mock_cb):
+        mock_client = MagicMock()
+        mock_cb.CloudBuildClient.return_value = mock_client
+        op = MagicMock()
+        op.result.return_value = MagicMock(
+            status=mock_cb.Build.Status.SUCCESS,
+        )
+        mock_client.create_build.return_value = op
+
+        from lamia_cloud.gcp.deployer import submit_build
+        submit_build(
+            "proj", "gs://bucket/src.tar.gz", "img:latest",
+            repo_url="https://github.com/lamia-lang/lamia",
+        )
+
+        step_calls = mock_cb.BuildStep.call_args_list
+        assert len(step_calls) == 2
+        assert step_calls[0].kwargs["name"] == "gcr.io/cloud-builders/git"
+        assert "https://github.com/lamia-lang/lamia" in step_calls[0].kwargs["args"]
+        assert step_calls[1].kwargs["name"] == "gcr.io/cloud-builders/docker"
+
+
 class TestCreateSourceTarball:
     def test_produces_valid_gzip_tarball(self, tmp_path):
         script = tmp_path / "hello.lm"

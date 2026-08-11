@@ -282,17 +282,24 @@ def package_deployment(
     script_name: str,
     name: str,
     uses_files: bool = False,
+    deploy_mode: str = "local",
 ) -> Path:
-    """Create a staging directory with everything needed for Cloud Build."""
+    """Create a staging directory with everything needed for Cloud Build.
+
+    In local mode the full project tree is included in the tarball.
+    In git mode only the Dockerfile and requirements.txt are included;
+    project files are cloned by a Cloud Build step before the Docker build.
+    """
     staging = Path(tempfile.mkdtemp(prefix="lamia-deploy-"))
 
-    project_dest = staging / "project"
-    project_dest.mkdir()
-    for f in collect_project_files(project_root):
-        rel = f.relative_to(project_root)
-        dest = project_dest / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(f, dest)
+    if deploy_mode != "git":
+        project_dest = staging / "project"
+        project_dest.mkdir()
+        for f in collect_project_files(project_root):
+            rel = f.relative_to(project_root)
+            dest = project_dest / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, dest)
 
     dockerfile_dest = staging / "Dockerfile"
     dockerfile_content = (TEMPLATES_DIR / "Dockerfile").read_text()
@@ -416,9 +423,31 @@ def submit_build(
     project_id: str,
     source_uri: str,
     image_name: str,
+    repo_url: str | None = None,
 ) -> None:
-    """Submit a Cloud Build to build the container image."""
+    """Submit a Cloud Build to build the container image.
+
+    When *repo_url* is provided (git mode), a shallow clone step runs first
+    so that project files are available in the ``project/`` directory before
+    the Docker build.  The uploaded tarball only needs the Dockerfile and
+    requirements.txt in this case.
+    """
     client = cloudbuild_v1.CloudBuildClient()
+
+    steps: list[cloudbuild_v1.BuildStep] = []
+    if repo_url:
+        steps.append(
+            cloudbuild_v1.BuildStep(
+                name="gcr.io/cloud-builders/git",
+                args=["clone", "--depth=1", repo_url, "project"],
+            )
+        )
+    steps.append(
+        cloudbuild_v1.BuildStep(
+            name="gcr.io/cloud-builders/docker",
+            args=["build", "-t", image_name, "."],
+        )
+    )
 
     build = cloudbuild_v1.Build(
         source=cloudbuild_v1.Source(
@@ -427,12 +456,7 @@ def submit_build(
                 object_="/".join(source_uri.split("/")[3:]),
             )
         ),
-        steps=[
-            cloudbuild_v1.BuildStep(
-                name="gcr.io/cloud-builders/docker",
-                args=["build", "-t", image_name, "."],
-            )
-        ],
+        steps=steps,
         images=[image_name],
     )
 
@@ -825,6 +849,7 @@ def deploy(
         script_name,
         name,
         uses_files=uses_files,
+        deploy_mode=deploy_mode,
     )
 
     try:
@@ -835,7 +860,10 @@ def deploy(
         source_uri = upload_source(project_id, tarball, name)
 
         logger.info("Submitting Cloud Build...")
-        submit_build(project_id, source_uri, image)
+        submit_build(
+            project_id, source_uri, image,
+            repo_url=repo_url if deploy_mode == "git" else None,
+        )
 
         files_bucket = None
         if uses_files:
