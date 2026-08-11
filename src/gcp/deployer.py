@@ -14,7 +14,9 @@ roles/aiplatform.user, so no API keys are needed at runtime.
 import hashlib
 import io
 import logging
+import re
 import shutil
+import subprocess
 import tarfile
 import tempfile
 import time
@@ -998,6 +1000,133 @@ def cleanup_stale_resources(
 
 
 # ---------------------------------------------------------------------------
+# Repository connection (Cloud Build GitHub App)
+# ---------------------------------------------------------------------------
+
+_CONNECTION_NAME = "lamia-github"
+
+
+def _sanitize_repo_name(repo_url: str) -> str:
+    """Derive a Cloud Build repository resource name from a remote URL.
+
+    ``https://github.com/acme/widgets.git`` → ``acme-widgets``
+    """
+    raw = repo_url.strip()
+    scp_match = re.match(r"^[^@]+@([^:]+):(.+)$", raw)
+    if scp_match:
+        path = scp_match.group(2)
+    else:
+        path = urllib.parse.urlparse(raw).path
+
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    return re.sub(r"[^a-z0-9-]", "-", path.lower()).strip("-")
+
+
+def _ensure_connection(project_id: str, location: str) -> str:
+    """Create the Cloud Build GitHub connection if it does not exist.
+
+    Returns the connection name.  On first run this prints the OAuth URL
+    the user must open to authorize the GitHub App.
+    """
+    check = subprocess.run(
+        [
+            "gcloud", "builds", "connections", "describe", _CONNECTION_NAME,
+            f"--region={location}", f"--project={project_id}",
+            "--format=value(installationState.stage)",
+        ],
+        capture_output=True, text=True,
+    )
+    if check.returncode == 0 and check.stdout.strip():
+        stage = check.stdout.strip()
+        if stage == "COMPLETE":
+            return _CONNECTION_NAME
+        logger.info(
+            f"Connection '{_CONNECTION_NAME}' exists but stage={stage}. "
+            "Complete the authorization in your browser."
+        )
+        return _CONNECTION_NAME
+
+    create = subprocess.run(
+        [
+            "gcloud", "builds", "connections", "create", "github",
+            _CONNECTION_NAME,
+            f"--region={location}", f"--project={project_id}",
+        ],
+        capture_output=True, text=True,
+    )
+    if create.returncode != 0:
+        raise RuntimeError(
+            f"Failed to create Cloud Build connection: {create.stderr.strip()}"
+        )
+    logger.info(
+        "Cloud Build GitHub connection created. "
+        "Follow the URL printed above to authorize the GitHub App."
+    )
+    return _CONNECTION_NAME
+
+
+def connect_repository(project_id: str, location: str, repo_url: str) -> dict:
+    """Link a GitHub repository for source-based Cloud Build.
+
+    Idempotent: re-connecting an already-connected repo is a no-op.
+    """
+    if is_repository_connected(project_id, location, repo_url):
+        return {"connected": True, "message": "Repository already connected."}
+
+    connection = _ensure_connection(project_id, location)
+    repo_name = _sanitize_repo_name(repo_url)
+
+    if not repo_url.startswith(("https://", "http://")):
+        scp_match = re.match(r"^[^@]+@([^:]+):(.+)$", repo_url.strip())
+        if scp_match:
+            host = scp_match.group(1)
+            path = scp_match.group(2).rstrip("/")
+            if path.endswith(".git"):
+                path = path[:-4]
+            remote_uri = f"https://{host}/{path}.git"
+        else:
+            remote_uri = repo_url
+    else:
+        remote_uri = repo_url
+        if not remote_uri.endswith(".git"):
+            remote_uri += ".git"
+
+    result = subprocess.run(
+        [
+            "gcloud", "builds", "repositories", "create", repo_name,
+            f"--remote-uri={remote_uri}",
+            f"--connection={connection}",
+            f"--region={location}", f"--project={project_id}",
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        err = result.stderr.strip()
+        if "ALREADY_EXISTS" in err:
+            return {"connected": True, "message": "Repository already connected."}
+        raise RuntimeError(f"Failed to link repository: {err}")
+
+    return {"connected": True, "message": f"Connected {repo_url} to cloud builds."}
+
+
+def is_repository_connected(project_id: str, location: str, repo_url: str) -> bool:
+    """Check whether a repository is linked via Cloud Build."""
+    repo_name = _sanitize_repo_name(repo_url)
+    result = subprocess.run(
+        [
+            "gcloud", "builds", "repositories", "describe", repo_name,
+            f"--connection={_CONNECTION_NAME}",
+            f"--region={location}", f"--project={project_id}",
+            "--format=value(name)",
+        ],
+        capture_output=True, text=True,
+    )
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+# ---------------------------------------------------------------------------
 # CloudDeployer implementation (wraps the module-level functions above)
 # ---------------------------------------------------------------------------
 
@@ -1086,3 +1215,9 @@ class GCPDeployer(CloudDeployer):
 
     def cleanup_stale_resources(self, max_age_days: int = STALE_RESOURCE_DAYS) -> list[str]:
         return cleanup_stale_resources(self.project_id, self.location, max_age_days=max_age_days)
+
+    def connect_repository(self, repo_url: str) -> dict:
+        return connect_repository(self.project_id, self.location, repo_url)
+
+    def is_repository_connected(self, repo_url: str) -> bool:
+        return is_repository_connected(self.project_id, self.location, repo_url)

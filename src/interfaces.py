@@ -187,6 +187,21 @@ class CloudDeployer(ABC):
         """
         ...
 
+    @abstractmethod
+    def connect_repository(self, repo_url: str) -> dict:
+        """Link a git repository to the cloud provider for source-based builds.
+
+        Opens a browser for OAuth if interactive.  Returns a status dict
+        with at least ``{"connected": bool, "message": str}``.
+        Idempotent: re-connecting an already-connected repo is a no-op.
+        """
+        ...
+
+    @abstractmethod
+    def is_repository_connected(self, repo_url: str) -> bool:
+        """Check whether *repo_url* is linked for source-based builds."""
+        ...
+
 
 class CloudTriggerProvider(ABC):
     """Abstract cloud trigger provider for event-driven multi-stage execution.

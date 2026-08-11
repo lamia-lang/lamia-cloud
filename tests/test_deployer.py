@@ -18,14 +18,17 @@ from lamia_cloud.gcp.deployer import (
     _cloud_logging_url,
     _extract_capability_flags,
     _memory_to_mib,
+    _sanitize_repo_name,
     collect_project_files,
     compute_resource_tier,
+    connect_repository,
     create_source_tarball,
     deployment_name,
     fetch_execution_logs,
     compute_resource_tier,
     create_source_tarball,
     ensure_apis_enabled,
+    is_repository_connected,
     package_deployment,
     run_job,
     sync_files_to_bucket,
@@ -722,3 +725,53 @@ class TestEnsureApisEnabled:
 
         assert "Service Usage API not enabled" in caplog.text
         assert mock_client.enable_service.call_count == 1
+
+
+class TestSanitizeRepoName:
+    def test_https_url(self):
+        assert _sanitize_repo_name("https://github.com/acme/widgets.git") == "acme-widgets"
+
+    def test_scp_url(self):
+        assert _sanitize_repo_name("git@github.com:acme/widgets.git") == "acme-widgets"
+
+    def test_nested_path(self):
+        assert _sanitize_repo_name("https://gitlab.com/org/group/repo.git") == "org-group-repo"
+
+
+class TestConnectRepository:
+    @patch("lamia_cloud.gcp.deployer.is_repository_connected", return_value=True)
+    def test_already_connected_is_noop(self, mock_check):
+        result = connect_repository("proj", "us-central1", "https://github.com/acme/widgets.git")
+        assert result["connected"] is True
+        assert "already" in result["message"].lower()
+
+    @patch("lamia_cloud.gcp.deployer.subprocess.run")
+    @patch("lamia_cloud.gcp.deployer.is_repository_connected", return_value=False)
+    @patch("lamia_cloud.gcp.deployer._ensure_connection", return_value="lamia-github")
+    def test_creates_repository(self, mock_conn, mock_check, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        result = connect_repository("proj", "us-central1", "https://github.com/acme/widgets.git")
+        assert result["connected"] is True
+        call_args = mock_run.call_args[0][0]
+        assert "repositories" in call_args
+        assert "create" in call_args
+
+    @patch("lamia_cloud.gcp.deployer.subprocess.run")
+    @patch("lamia_cloud.gcp.deployer.is_repository_connected", return_value=False)
+    @patch("lamia_cloud.gcp.deployer._ensure_connection", return_value="lamia-github")
+    def test_already_exists_treated_as_success(self, mock_conn, mock_check, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="ALREADY_EXISTS")
+        result = connect_repository("proj", "us-central1", "https://github.com/acme/widgets.git")
+        assert result["connected"] is True
+
+
+class TestIsRepositoryConnected:
+    @patch("lamia_cloud.gcp.deployer.subprocess.run")
+    def test_connected(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="projects/p/locations/l/connections/c/repositories/r\n")
+        assert is_repository_connected("proj", "us-central1", "https://github.com/acme/widgets.git") is True
+
+    @patch("lamia_cloud.gcp.deployer.subprocess.run")
+    def test_not_connected(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="NOT_FOUND")
+        assert is_repository_connected("proj", "us-central1", "https://github.com/acme/widgets.git") is False
