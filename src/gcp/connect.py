@@ -6,10 +6,14 @@ runtime), and IAM bindings.  All naming is deterministic and derived from
 the repository URL so that reconnecting is idempotent.
 """
 
+import atexit
 import hashlib
+import json
 import logging
+import os
 import re
 import subprocess
+import tempfile
 import urllib.parse
 
 from google.cloud import iam_admin_v1, resourcemanager_v3
@@ -640,6 +644,79 @@ def disconnect_repository(project_id: str, location: str, repo_url: str) -> dict
 
 
 # ---------------------------------------------------------------------------
+# CI authentication (WIF OIDC token exchange)
+# ---------------------------------------------------------------------------
+
+
+def _write_credential_config(wif_provider: str, service_account: str) -> str:
+    """Write an external-account credential config and return its path.
+
+    Replicates what ``google-github-actions/auth@v2`` does, so the
+    google-auth SDK exchanges the GitHub OIDC token for GCP credentials
+    via STS.
+    """
+    token_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
+    token_bearer = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+    if not token_url or not token_bearer:
+        raise RuntimeError(
+            "GitHub OIDC token not available. Ensure your workflow has:\n"
+            "  permissions:\n"
+            "    id-token: write"
+        )
+
+    audience = f"//iam.googleapis.com/{wif_provider}"
+    encoded_audience = urllib.parse.quote(audience, safe="")
+
+    cred_config = {
+        "type": "external_account",
+        "audience": audience,
+        "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+        "token_url": "https://sts.googleapis.com/v1/token",
+        "credential_source": {
+            "url": f"{token_url}&audience={encoded_audience}",
+            "headers": {
+                "Authorization": f"bearer {token_bearer}",
+            },
+            "format": {
+                "type": "json",
+                "subject_token_field_name": "value",
+            },
+        },
+        "service_account_impersonation_url": (
+            f"https://iamcredentials.googleapis.com/v1/projects/-/"
+            f"serviceAccounts/{service_account}:generateAccessToken"
+        ),
+    }
+
+    fd, cred_path = tempfile.mkstemp(suffix=".json", prefix="lamia-wif-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(cred_config, f)
+    os.chmod(cred_path, 0o600)
+    atexit.register(lambda: _cleanup_cred_file(cred_path))
+    return cred_path
+
+
+def _cleanup_cred_file(path: str) -> None:
+    """Remove temporary credential config on process exit."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def configure_ci_auth(project_id: str, repo_url: str, connection_id: str) -> None:
+    """Resolve a connection ID into WIF credentials for the current CI run."""
+    project_number, suffix = parse_connection_id(connection_id)
+    wif_provider = derive_wif_provider_from_connection(project_number, suffix)
+    service_account = ci_sa_email_from_connection(project_id, suffix)
+
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = _write_credential_config(
+        wif_provider, service_account,
+    )
+    logger.info("CI auth: credentials configured via WIF")
+
+
+# ---------------------------------------------------------------------------
 # GCPRepositoryConnector (wraps the module-level functions)
 # ---------------------------------------------------------------------------
 
@@ -661,6 +738,9 @@ class GCPRepositoryConnector(RepositoryConnector):
 
     def connect_repository(self, repo_url: str, *, branch: str = "main") -> dict:
         return connect_repository(self.project_id, self.location, repo_url, branch=branch)
+
+    def configure_ci_auth(self, repo_url: str, connection_id: str) -> None:
+        configure_ci_auth(self.project_id, repo_url, connection_id)
 
     def is_repository_connected(self, repo_url: str) -> bool:
         return is_repository_connected(self.project_id, self.location, repo_url)

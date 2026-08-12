@@ -215,6 +215,16 @@ class RepositoryConnector(ABC):
         ...
 
     @abstractmethod
+    def configure_ci_auth(self, repo_url: str, connection_id: str) -> None:
+        """Authenticate the current CI run for a connected repository.
+
+        Resolves the connection ID into provider credentials and installs
+        them where the provider SDK expects to find them.  Raises
+        RuntimeError when the run cannot be authenticated.
+        """
+        ...
+
+    @abstractmethod
     def is_repository_connected(self, repo_url: str) -> bool:
         """Verify the complete connection chain for source-based builds.
 

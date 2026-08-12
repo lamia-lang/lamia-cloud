@@ -1,5 +1,6 @@
 """Tests for lamia_cloud.gcp.connect (repository connection, WIF, per-repo SAs)."""
 
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -479,3 +480,71 @@ class TestIsRepositoryConnected:
                 "proj", "us-central1", "https://github.com/acme/widgets.git"
             )
         assert any("assertion.ref" in r.message for r in caplog.records)
+
+
+class TestConfigureCiAuth:
+    """Connection ID is resolved into WIF credentials inside the GCP package."""
+
+    @pytest.fixture(autouse=True)
+    def _oidc_env(self, monkeypatch):
+        monkeypatch.setenv(
+            "ACTIONS_ID_TOKEN_REQUEST_URL",
+            "https://vstoken.actions.githubusercontent.com/token",
+        )
+        monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ghs_fake")
+        monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+
+    def _credentials(self):
+        import json
+        import os
+        path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+        return path, json.loads(open(path).read())
+
+    def test_derives_provider_and_service_account_from_id(self):
+        from lamia_cloud.gcp.connect import configure_ci_auth
+        configure_ci_auth(
+            "proj", "https://github.com/acme/widgets.git", "v1-123456-f60ecdb16e5e",
+        )
+
+        path, cred = self._credentials()
+        assert cred["type"] == "external_account"
+        assert "projects/123456/" in cred["audience"]
+        assert "lamia-gh-f60ecdb16e5e" in cred["audience"]
+        assert "lm-ci-f60ecdb16e5e" in cred["service_account_impersonation_url"]
+        assert "ghs_fake" in cred["credential_source"]["headers"]["Authorization"]
+        os.unlink(path)
+
+    def test_credential_file_is_owner_only(self):
+        import stat
+        from lamia_cloud.gcp.connect import configure_ci_auth
+        configure_ci_auth(
+            "proj", "https://github.com/acme/widgets.git", "v1-123456-f60ecdb16e5e",
+        )
+
+        path, _ = self._credentials()
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+        os.unlink(path)
+
+    def test_malformed_connection_id_raises(self):
+        from lamia_cloud.gcp.connect import configure_ci_auth
+        with pytest.raises(ValueError, match="Invalid LAMIA_CONNECTION_ID"):
+            configure_ci_auth("proj", "https://github.com/acme/widgets.git", "garbage")
+
+    def test_missing_oidc_token_raises(self, monkeypatch):
+        monkeypatch.delenv("ACTIONS_ID_TOKEN_REQUEST_URL", raising=False)
+        from lamia_cloud.gcp.connect import configure_ci_auth
+        with pytest.raises(RuntimeError, match="id-token: write"):
+            configure_ci_auth(
+                "proj", "https://github.com/acme/widgets.git", "v1-123456-f60ecdb16e5e",
+            )
+
+    def test_connector_delegates(self):
+        from lamia_cloud.gcp.connect import GCPRepositoryConnector
+        connector = GCPRepositoryConnector.from_config({"project_id": "proj"})
+        connector.configure_ci_auth(
+            "https://github.com/acme/widgets.git", "v1-123456-f60ecdb16e5e",
+        )
+
+        path, cred = self._credentials()
+        assert "lm-ci-f60ecdb16e5e" in cred["service_account_impersonation_url"]
+        os.unlink(path)
