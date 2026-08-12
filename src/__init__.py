@@ -9,7 +9,7 @@ Public API:
     Types: CloudLLMRequest, CloudLLMResponse, CloudScheduleJob, CloudJobStatus,
            TriggerStage, TriggerDeploymentPlan
 """
-from lamia_cloud.interfaces import CloudDeployer, CloudLLM, CloudScheduler, CloudTriggerProvider
+from lamia_cloud.interfaces import CloudDeployer, CloudLLM, CloudScheduler, CloudTriggerProvider, RepositoryConnector
 from lamia_cloud.types import (
     CloudLLMRequest,
     CloudLLMResponse,
@@ -19,18 +19,17 @@ from lamia_cloud.types import (
     TriggerDeploymentPlan,
 )
 from lamia_cloud.gcp import VertexLLM, is_on_gcp
-from lamia_cloud.loader import get_deployer, get_scheduler, get_trigger_provider
-from lamia_cloud.gcp.deployer import (
+from lamia_cloud.loader import get_connector, get_deployer, get_scheduler, get_trigger_provider
+from lamia_cloud.gcp.deployer import ensure_apis_enabled
+from lamia_cloud.gcp.connect import (
     ci_sa_email,
     ci_sa_email_from_connection,
     derive_wif_provider,
     derive_wif_provider_from_connection,
-    ensure_apis_enabled,
     exec_sa_email,
     exec_sa_email_from_connection,
     parse_connection_id,
 )
-from lamia_cloud.loader import get_scheduler
 
 _llm_instance: CloudLLM = None
 
@@ -79,9 +78,11 @@ __all__ = [
     "TriggerStage",
     "TriggerDeploymentPlan",
     "get_cloud_llm",
+    "get_connector",
     "get_deployer",
     "get_scheduler",
     "get_trigger_provider",
+    "RepositoryConnector",
     "is_on_cloud",
     "ci_sa_email",
     "ci_sa_email_from_connection",

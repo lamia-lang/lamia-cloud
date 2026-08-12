@@ -187,6 +187,21 @@ class CloudDeployer(ABC):
         """
         ...
 
+class RepositoryConnector(ABC):
+    """Abstract connector for linking git repositories to cloud providers.
+
+    Manages the trust chain between a git host (e.g. GitHub) and the cloud
+    provider so that CI workflows can authenticate and deploy without static
+    credentials.  Each provider implementation handles its own identity
+    federation and service account setup.
+    """
+
+    @classmethod
+    @abstractmethod
+    def from_config(cls, cloud_cfg: dict) -> "RepositoryConnector":
+        """Create instance from config.yaml cloud section."""
+        ...
+
     @abstractmethod
     def connect_repository(self, repo_url: str, *, branch: str = "main") -> dict:
         """Link a git repository to the cloud provider for source-based builds.
@@ -203,10 +218,8 @@ class CloudDeployer(ABC):
     def is_repository_connected(self, repo_url: str) -> bool:
         """Verify the complete connection chain for source-based builds.
 
-        Checks all resources created by ``connect_repository``: Cloud Build
-        repo link, WIF pool, WIF provider (with repo-scoped attribute
-        condition), per-repo CI and runtime service accounts.  Returns True
-        only when every component exists and is configured correctly.
+        Returns True only when every component exists and is configured
+        correctly.
         """
         ...
 
@@ -214,8 +227,7 @@ class CloudDeployer(ABC):
     def disconnect_repository(self, repo_url: str) -> dict:
         """Remove all cloud resources for a previously connected repository.
 
-        Deletes WIF provider, per-repo service accounts, and Cloud Build
-        repository link.  Returns ``{"disconnected": True, "deleted": [...]}``.
+        Returns ``{"disconnected": True, "deleted": [...]}``.
         """
         ...
 

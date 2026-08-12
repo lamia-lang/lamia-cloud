@@ -357,7 +357,8 @@ Scheduler expression and is normalized to hourly there.
 ```
 src/gcp/
 ├── README.md               ← this file
-├── __init__.py             ← exports GCPCloudScheduler, GCPTriggerProvider, VertexLLM
+├── __init__.py             ← exports GCPCloudScheduler, GCPTriggerProvider, VertexLLM, etc.
+├── connect.py              ← repository connection: WIF, per-repo SAs, Cloud Build GitHub App
 ├── deployer.py             ← Cloud Build + Cloud Run Job deployment
 ├── scheduler.py            ← Cloud Scheduler integration
 ├── scheduler_job.py        ← Cloud Scheduler job construction (shared by scheduler + triggers)
@@ -406,3 +407,145 @@ When changing trigger behavior:
 4. Update `lamia/actions/trigger.py` if runtime interface changes.
 5. Update `lamia/docs/user-guide/triggers.md` for user-facing changes.
 6. **Update this README** to keep the technical reference in sync.
+
+---
+
+## Repository Connection — Security Architecture
+
+`connect.py` implements the trust chain between GitHub and GCP so that CI
+workflows can deploy without static credentials. This section explains
+**why** each decision was made, not just what was built.
+
+### Trust Model
+
+```
+GitHub Actions                  Lamia                     GCP
+     |                            |                        |
+     |  OIDC token (short-lived)  |                        |
+     |--------------------------->|                        |
+     |                            |  STS token exchange    |
+     |                            |----------------------->|
+     |                            |  GCP access token      |
+     |                            |<-----------------------|
+     |                            |  deploy/run            |
+     |                            |----------------------->|
+```
+
+GitHub's OIDC token is cryptographically signed and contains claims about
+the repository, branch, and workflow. GCP Workload Identity Federation
+validates these claims against a pre-configured trust policy. No long-lived
+credentials exist anywhere in this flow.
+
+### What `lamia cloud connect` Creates
+
+| Resource | Purpose | Naming |
+|----------|---------|--------|
+| WIF Pool | Shared identity pool for all lamia repos in the project | `lamia-github-pool` |
+| WIF Provider | Per-repo OIDC trust with branch restriction | `lamia-gh-{suffix}` |
+| CI Service Account | Deploy permissions: build containers, create/update jobs | `lm-ci-{suffix}` |
+| Runtime Service Account | Minimal runtime permissions (e.g. Vertex AI) | `lm-run-{suffix}` |
+| Cloud Build Connection | GitHub App installation for source cloning | `lamia-github` |
+
+The `{suffix}` is a 12-hex hash of the canonical repo URL, making names
+opaque and stable across reconnects.
+
+### Why Branch Restriction
+
+The WIF provider's attribute condition restricts authentication to a
+specific repository AND branch:
+
+```
+assertion.repository == "owner/repo" && assertion.ref == "refs/heads/main"
+```
+
+**Why not all branches?** A compromised feature branch could deploy
+malicious code without code review. Requiring merge to `main` ensures that
+branch protection rules and review gates apply before any deployment.
+An attacker who pushes to a feature branch cannot authenticate to GCP.
+
+**Why not pull requests?** Fork PRs run workflows in the fork's context.
+Without branch restriction, a fork PR author could authenticate with the
+base repo's WIF credentials and deploy to the base repo's cloud project.
+The `assertion.ref` check blocks this because fork PR refs never match
+`refs/heads/main`.
+
+**Public vs private repos.** Public repos face the highest risk because
+anyone can submit a PR. Branch restriction is critical. Even with all
+protections, a malicious contribution merged to main by a compromised
+maintainer account would deploy. Maintainers must enforce code reviews and
+branch protection rules. Private repos benefit from access control limiting
+who can push or merge. The primary risks are compromised collaborator
+accounts and credential leaks. For private repos, the branch restriction
+may be relaxed (e.g. `--branch develop`) since contributors are vetted.
+
+Re-running `lamia cloud connect --branch <name>` on an already-connected
+repository rewrites the restriction to the new branch.
+
+### Why Per-Repo Service Accounts (Not Shared)
+
+Each connected repository gets its own CI and runtime service accounts.
+If repository A is compromised, its service account cannot access resources
+deployed by repository B in the same GCP project. A shared service account
+means one compromised repo affects all repos in the project.
+
+GCP SA naming uses an opaque hash suffix (`lm-ci-{suffix}`,
+`lm-run-{suffix}`) derived from the repo URL. Max 30 characters, stable
+across reconnects, no repo name leakage.
+
+### Why Two Service Accounts Per Repo
+
+The CI SA (`lm-ci-*`) has permissions to build containers, deploy Cloud Run
+Jobs, and manage storage. The runtime SA (`lm-run-*`) has only the
+permissions the script needs at runtime (e.g. `roles/aiplatform.user` for
+Vertex AI).
+
+This means deployed code cannot redeploy itself, escalate its own
+permissions, or modify infrastructure. A script that calls Vertex AI at
+runtime has no ability to push new containers or change Cloud Run Job
+configurations.
+
+### Why `pull_request_target` Is Explicitly Rejected
+
+The `pull_request_target` GitHub event runs workflows in the **base
+repository** context, not the fork. This means a fork PR with a
+`pull_request_target` workflow trigger could use the base repo's WIF
+credentials to deploy code the base maintainers never reviewed.
+
+Lamia checks `GITHUB_EVENT_NAME` at CI time and refuses to authenticate
+when this event is detected.
+
+### Why Subprocess Exit Codes Are Checked
+
+All `gcloud` subprocess calls use `_run_gcloud()` which raises on non-zero
+exit codes (unless the error is `ALREADY_EXISTS`, which indicates
+idempotent re-runs). Silent `gcloud` failures during WIF setup would
+leave partial infrastructure. A half-configured WIF pool with missing IAM
+bindings is worse than no WIF at all because it creates a false sense of
+security.
+
+### Why CEL Condition Operands Are Validated
+
+The WIF attribute condition is assembled as a string:
+
+```
+assertion.repository=="owner/repo" && assertion.ref=="refs/heads/main"
+```
+
+If the branch or repo name operand contains quotes or boolean operators,
+an attacker could craft a value like `main" || true || "` that widens the
+condition to match any repo or branch. `_validate_condition_operand()`
+rejects special characters before any GCP API call is made.
+
+### Why Credential Files Get `0600` + `atexit` Cleanup
+
+Temporary credential files created during CI authentication are written
+with owner-only read/write permissions (0600). On shared CI runners (like
+GitHub's hosted runners), other jobs on the same machine could otherwise
+read credential files written by a previous job. The `atexit` handler
+ensures cleanup even if the process crashes.
+
+### Disconnect and Revocation
+
+`lamia cloud disconnect` removes the WIF provider, both service accounts,
+and the Cloud Build repository link. The shared WIF pool is left intact
+because other repos in the same project may use it.

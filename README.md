@@ -94,66 +94,9 @@ No environment variables are required.
   `https://console.cloud.google.com/vertex-ai?project=<your-project-id>`
 - After accepting terms, re-run the schedule/install command once.
 
-## CI Authentication Architecture
+## CI Authentication
 
-When lamia detects a CI environment (GitHub Actions), it authenticates to the cloud provider without static credentials. This section describes the GCP implementation; other providers follow the same pattern through the `CloudDeployer` interface.
-
-### Trust Model
-
-```
-GitHub Actions                  Lamia                     GCP
-     |                            |                        |
-     |  OIDC token (short-lived)  |                        |
-     |--------------------------->|                        |
-     |                            |  STS token exchange    |
-     |                            |----------------------->|
-     |                            |  GCP access token      |
-     |                            |<-----------------------|
-     |                            |  deploy/run            |
-     |                            |----------------------->|
-```
-
-GitHub's OIDC token is cryptographically signed and contains claims about the repository, branch, and workflow. GCP's Workload Identity Federation validates these claims against a pre-configured trust policy. No long-lived credentials exist anywhere in this flow.
-
-### What `lamia cloud connect` Creates (GCP)
-
-| Resource | Purpose | Naming Convention |
-|----------|---------|-------------------|
-| WIF Pool | Shared identity pool for all lamia-connected repos in the project | `lamia-github-pool` |
-| WIF Provider | Per-repo OIDC trust with branch restriction | `lamia-gh-{sanitized-repo}` |
-| CI Service Account | Deploy permissions: build containers, create/update Cloud Run Jobs | `lm-ci-{sanitized-repo}` |
-| Runtime Service Account | Minimal permissions: only what deployed scripts need (e.g. Vertex AI) | `lm-run-{sanitized-repo}` |
-| Cloud Build Connection | GitHub App installation for source cloning | `lamia-github` |
-
-### Security Decisions
-
-**Per-repo service accounts (not shared).** Each connected repository gets its own CI and runtime service accounts. If repository A is compromised, its service account cannot access resources deployed by repository B in the same GCP project. This prevents lateral movement between repositories.
-
-**Deploy/runtime SA separation.** The CI service account (`lm-ci-*`) has permissions to build containers and deploy Cloud Run Jobs. The runtime service account (`lm-run-*`) has only the permissions the script needs (e.g. `roles/aiplatform.user` for Vertex AI). Deployed code cannot redeploy, modify infrastructure, or escalate its own permissions.
-
-**Branch-scoped WIF condition.** The WIF provider's attribute condition restricts authentication to a specific repository AND branch:
-```
-assertion.repository == "owner/repo" && assertion.ref == "refs/heads/main"
-```
-Feature branches, forks, and pull requests cannot obtain credentials even if a workflow runs.
-
-**Subprocess error checking.** All `gcloud` subprocess calls check exit codes and raise on failure. Silent failures during WIF setup are not possible.
-
-**Runtime validation.** At CI time, lamia validates the workspace git remote against the connected repository stored in `config.yaml`. This catches git remote tampering where an attacker changes `origin` to point to a different repository while using the victim's WIF credentials.
-
-**`pull_request_target` rejection.** Lamia explicitly refuses to authenticate when the GitHub event is `pull_request_target`. This event runs in the base repository context and would allow a fork PR to deploy with the base repo's credentials.
-
-**Credential file hygiene.** Temporary credential files are created with `0600` permissions (owner-only read/write) and cleaned up via `atexit` handler when the process exits.
-
-### Open-Source vs Private Repositories
-
-**Public repositories** face the highest risk because anyone can submit a pull request. The branch restriction in WIF is critical — only code merged to `main` can trigger deployments. Maintainers must enforce code reviews and branch protection rules. The WIF trust model prevents fork PRs from authenticating, but a malicious contribution merged to main by a compromised maintainer account would deploy.
-
-**Private repositories** benefit from access control limiting who can push or merge. The primary risks are compromised collaborator accounts and credential leaks. Per-repo SA isolation limits blast radius. For private repos, the branch restriction may be relaxed (e.g. allowing `develop` branch deploys) since contributors are trusted.
-
-### Disconnect and Revocation
-
-`lamia cloud disconnect` removes the WIF provider, both service accounts, and the Cloud Build repository link. The shared WIF pool is left intact (other repos may use it). Connection details are removed from `config.yaml`.
+Repository connection and CI authentication are managed by `lamia cloud connect`. For the security architecture and design decisions, see [src/gcp/README.md](src/gcp/README.md#repository-connection--security-architecture).
 
 ## Development
 
