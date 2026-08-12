@@ -133,6 +133,11 @@ def _connection_suffix(repo_url: str) -> str:
     return hashlib.sha256(identity.encode()).hexdigest()[:12]
 
 
+def connection_suffix_for_repo(repo_url: str) -> str:
+    """Repository digest embedded in a connection ID."""
+    return _connection_suffix(repo_url)
+
+
 def make_connection_id(project_number: str, repo_url: str) -> str:
     """Public Lamia connection handle for CI."""
     return f"v1-{project_number}-{_connection_suffix(repo_url)}"
@@ -319,11 +324,7 @@ _REPO_FULL_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
 
 def _validate_condition_operand(value: str, kind: str, pattern: re.Pattern) -> str:
-    """Reject values that cannot be safely embedded in a CEL attribute condition.
-
-    The condition is assembled as a string, so an operand containing quotes or
-    boolean operators could widen the condition to admit any repository or ref.
-    """
+    """Reject values unsafe to embed in a CEL attribute condition."""
     if not pattern.match(value) or '"' in value or "\\" in value:
         raise RuntimeError(
             f"Invalid {kind} {value!r}: only letters, digits and '.', '_', '-', '/' "

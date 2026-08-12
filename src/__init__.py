@@ -24,6 +24,7 @@ from lamia_cloud.gcp.deployer import ensure_apis_enabled
 from lamia_cloud.gcp.connect import (
     ci_sa_email,
     ci_sa_email_from_connection,
+    connection_suffix_for_repo,
     derive_wif_provider,
     derive_wif_provider_from_connection,
     exec_sa_email,
@@ -91,5 +92,6 @@ __all__ = [
     "ensure_apis_enabled",
     "exec_sa_email",
     "exec_sa_email_from_connection",
+    "connection_suffix_for_repo",
     "parse_connection_id",
 ]
