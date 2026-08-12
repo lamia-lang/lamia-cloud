@@ -188,18 +188,35 @@ class CloudDeployer(ABC):
         ...
 
     @abstractmethod
-    def connect_repository(self, repo_url: str) -> dict:
+    def connect_repository(self, repo_url: str, *, branch: str = "main") -> dict:
         """Link a git repository to the cloud provider for source-based builds.
 
         Opens a browser for OAuth if interactive.  Returns a status dict
         with at least ``{"connected": bool, "message": str}``.
+        May include provider-specific CI auth values that callers should
+        store as CI variables (not in project config files).
         Idempotent: re-connecting an already-connected repo is a no-op.
         """
         ...
 
     @abstractmethod
     def is_repository_connected(self, repo_url: str) -> bool:
-        """Check whether *repo_url* is linked for source-based builds."""
+        """Verify the complete connection chain for source-based builds.
+
+        Checks all resources created by ``connect_repository``: Cloud Build
+        repo link, WIF pool, WIF provider (with repo-scoped attribute
+        condition), per-repo CI and runtime service accounts.  Returns True
+        only when every component exists and is configured correctly.
+        """
+        ...
+
+    @abstractmethod
+    def disconnect_repository(self, repo_url: str) -> dict:
+        """Remove all cloud resources for a previously connected repository.
+
+        Deletes WIF provider, per-repo service accounts, and Cloud Build
+        repository link.  Returns ``{"disconnected": True, "deleted": [...]}``.
+        """
         ...
 
 
