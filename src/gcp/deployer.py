@@ -125,20 +125,33 @@ def _touch_last_used(client, project_id: str, location: str, target: str) -> Non
 
 
 def ensure_apis_enabled(project_id: str) -> None:
-    """Enable all GCP APIs required by lamia-cloud."""
+    """Enable any of the required GCP APIs that aren't already enabled."""
     client = service_usage_v1.ServiceUsageClient()
-    for api in _REQUIRED_GCP_APIS:
-        service_name = f"projects/{project_id}/services/{api}"
-        try:
-            client.enable_service(request={"name": service_name})
-        except Exception as e:
-            if "SERVICE_DISABLED" in str(e) and "serviceusage" in api:
-                logger.warning(
-                    f"Service Usage API not enabled. Run once:\n"
-                    f"  gcloud services enable serviceusage.googleapis.com "
-                    f"--project={project_id}"
-                )
-                return
+    parent = f"projects/{project_id}"
+    names = [f"{parent}/services/{api}" for api in _REQUIRED_GCP_APIS]
+
+    try:
+        response = client.batch_get_services(request={"parent": parent, "names": names})
+        disabled = [
+            service.name.rsplit("/", 1)[-1]
+            for service in response.services
+            if service.state != service_usage_v1.State.ENABLED
+        ]
+    except Exception:
+        disabled = list(_REQUIRED_GCP_APIS)
+
+    if not disabled:
+        return
+
+    try:
+        client.batch_enable_services(request={"parent": parent, "service_ids": disabled})
+    except Exception as e:
+        if "SERVICE_DISABLED" in str(e) and "serviceusage.googleapis.com" in disabled:
+            logger.warning(
+                f"Service Usage API not enabled. Run once:\n"
+                f"  gcloud services enable serviceusage.googleapis.com "
+                f"--project={project_id}"
+            )
 
 
 def compute_resource_tier(
