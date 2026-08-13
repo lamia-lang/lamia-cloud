@@ -3,6 +3,7 @@
 import io
 import tarfile
 import urllib.parse
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -337,49 +338,124 @@ class TestDeploymentName:
 
 
 class TestCloudLoggingUrl:
-    def test_builds_filtered_console_url(self):
-        url = _cloud_logging_url(
+    NAME = "projects/p/locations/us-central1/jobs/j/executions/exec-123"
+
+    def _url(self, **kwargs):
+        return _cloud_logging_url(
             project_id="my-project",
             target="lamia-hello",
-            execution_name="projects/p/locations/l/jobs/j/executions/exec-123",
+            execution_name=self.NAME,
+            **kwargs,
         )
+
+    def test_builds_filtered_console_url(self):
+        url = self._url()
         assert url.startswith("https://console.cloud.google.com/logs/query;")
         assert "project=my-project" in url
         assert "lamia-hello" in url
         assert "exec-123" in urllib.parse.unquote(url)
 
+    def test_filter_is_fully_encoded(self):
+        """A raw '/' would end the path segment and truncate the filter."""
+        url = self._url()
+        query = url.split(";query=", 1)[1].split("?", 1)[0]
+        assert "/" not in query
+        assert "run.googleapis.com%2Fexecution_name" in query
+
+    def test_includes_execution_region(self):
+        assert 'resource.labels.location="us-central1"' in urllib.parse.unquote(self._url())
+
+    def test_region_omitted_when_name_has_none(self):
+        url = _cloud_logging_url(
+            project_id="my-project", target="lamia-hello", execution_name="exec-123",
+        )
+        assert "resource.labels.location" not in urllib.parse.unquote(url)
+
+    def test_time_range_spans_the_execution(self):
+        start = datetime(2026, 8, 13, 8, 51, 41, tzinfo=timezone.utc)
+        end = datetime(2026, 8, 13, 8, 53, 48, tzinfo=timezone.utc)
+
+        window = urllib.parse.unquote(self._url(start_time=start, end_time=end))
+        window = window.split(";timeRange=", 1)[1].split("?", 1)[0]
+        begins, _, finishes = window.partition("/")
+
+        assert begins == "2026-08-13T08:51:41Z"
+        assert finishes == "2026-08-13T08:58:48Z", "tail buffer for late log delivery"
+
+    def test_no_time_range_without_start(self):
+        assert ";timeRange=" not in self._url()
+
 
 class TestFetchExecutionLogs:
-    @patch("lamia_cloud.gcp.deployer.cloud_logging.Client")
-    def test_splits_stdout_and_stderr_by_severity(self, mock_client_cls):
-        info_entry = MagicMock()
-        info_entry.payload = "hello stdout"
-        info_entry.severity = "INFO"
+    """Container output only: audit logs share the execution's resource labels."""
 
-        error_entry = MagicMock()
-        error_entry.payload = "something failed"
-        error_entry.severity = "ERROR"
+    @staticmethod
+    def _entry(payload, stream="stdout", severity="INFO"):
+        entry = MagicMock()
+        entry.payload = payload
+        entry.severity = severity
+        entry.log_name = f"projects/proj/logs/run.googleapis.com%2F{stream}"
+        return entry
 
-        warning_entry = MagicMock()
-        warning_entry.payload = "watch out"
-        warning_entry.severity = "WARNING"
-
+    def _fetch(self, mock_client_cls, entries):
         mock_client = MagicMock()
-        mock_client.list_entries.return_value = [info_entry, error_entry, warning_entry]
+        mock_client.list_entries.return_value = entries
         mock_client_cls.return_value = mock_client
-
-        stdout, stderr = fetch_execution_logs(
+        result = fetch_execution_logs(
             project_id="proj",
             target="lamia-task",
             execution_name="projects/p/locations/l/jobs/j/executions/exec-1",
         )
+        return result, mock_client
 
-        assert stdout == "hello stdout"
-        assert stderr == "something failed\nwatch out"
-        mock_client.list_entries.assert_called_once()
+    @patch("lamia_cloud.gcp.deployer.cloud_logging.Client")
+    def test_splits_by_log_stream_not_severity(self, mock_client_cls):
+        entries = [
+            self._entry("hello stdout"),
+            self._entry("something failed", stream="stderr", severity="ERROR"),
+            self._entry("watch out", severity="WARNING"),
+        ]
+
+        (stdout, stderr), _ = self._fetch(mock_client_cls, entries)
+
+        assert stdout == "hello stdout\nwatch out"
+        assert stderr == "something failed"
+
+    @patch("lamia_cloud.gcp.deployer.cloud_logging.Client")
+    def test_filter_restricts_to_container_streams(self, mock_client_cls):
+        _, mock_client = self._fetch(mock_client_cls, [])
+
         filter_arg = mock_client.list_entries.call_args.kwargs["filter_"]
         assert 'resource.labels.job_name="lamia-task"' in filter_arg
         assert 'execution_name"="exec-1"' in filter_arg
+        assert "run.googleapis.com%2Fstdout" in filter_arg
+        assert "run.googleapis.com%2Fstderr" in filter_arg
+        assert "logName=(" in filter_arg
+
+    @patch("lamia_cloud.gcp.deployer.cloud_logging.Client")
+    def test_structured_payload_uses_message_field(self, mock_client_cls):
+        entries = [self._entry({"message": "structured line", "severity": "INFO"})]
+
+        (stdout, _), _ = self._fetch(mock_client_cls, entries)
+
+        assert stdout == "structured line"
+
+    @patch("lamia_cloud.gcp.deployer.cloud_logging.Client")
+    def test_structured_payload_without_message_is_json(self, mock_client_cls):
+        entries = [self._entry({"foo": "bar"})]
+
+        (stdout, _), _ = self._fetch(mock_client_cls, entries)
+
+        assert stdout == '{"foo": "bar"}'
+        assert "OrderedDict" not in stdout
+
+    @patch("lamia_cloud.gcp.deployer.cloud_logging.Client")
+    def test_empty_payloads_are_dropped(self, mock_client_cls):
+        entries = [self._entry(None), self._entry(""), self._entry("kept")]
+
+        (stdout, _), _ = self._fetch(mock_client_cls, entries)
+
+        assert stdout == "kept"
 
 
 class _FakeBlob:

@@ -13,6 +13,7 @@ roles/aiplatform.user, so no API keys are needed at runtime.
 
 import hashlib
 import io
+import json
 import logging
 import re
 import shutil
@@ -56,6 +57,15 @@ logger = logging.getLogger(__name__)
 
 TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 FILES_MOUNT_PATH = "/mnt/lamia-files"
+
+# Cloud Run writes container output to these two log streams.  Audit logs
+# carry the same resource labels, so the stream is what separates script
+# output from Cloud Run's own bookkeeping.
+STDOUT_LOG_ID = "run.googleapis.com%2Fstdout"
+STDERR_LOG_ID = "run.googleapis.com%2Fstderr"
+
+# Logs can land slightly after an execution reports completion.
+LOG_WINDOW_TAIL = timedelta(minutes=5)
 
 _REQUIRED_GCP_APIS = (
     "serviceusage.googleapis.com",
@@ -593,7 +603,13 @@ def _result_from_execution(
     if execution.completion_time and execution.start_time:
         elapsed = (execution.completion_time - execution.start_time).total_seconds()
 
-    logs_url = _cloud_logging_url(project_id, target, execution.name)
+    logs_url = _cloud_logging_url(
+        project_id,
+        target,
+        execution.name,
+        start_time=execution.start_time or None,
+        end_time=execution.completion_time or None,
+    )
 
     return {
         "exit_code": exit_code,
@@ -644,18 +660,63 @@ def run_job(
     return _result_from_execution(project_id, target, execution)
 
 
-def _cloud_logging_url(project_id: str, target: str, execution_name: str) -> str:
-    """Build a Cloud Logging URL filtered to this execution."""
-    execution_id = execution_name.rsplit("/", 1)[-1] if "/" in execution_name else execution_name
-    query = (
-        f'resource.type="cloud_run_job" '
-        f'resource.labels.job_name="{target}" '
-        f'labels."run.googleapis.com/execution_name"="{execution_id}"'
+def _execution_id(execution_name: str) -> str:
+    return execution_name.rsplit("/", 1)[-1] if "/" in execution_name else execution_name
+
+
+def _location_from_execution_name(execution_name: str) -> str:
+    """Read the region out of a fully qualified execution resource name."""
+    parts = execution_name.split("/")
+    if "locations" in parts:
+        index = parts.index("locations")
+        if index + 1 < len(parts):
+            return parts[index + 1]
+    return ""
+
+
+def _log_time_range(start_time, end_time) -> str:
+    """Logs Explorer time window covering the execution, or '' without a start."""
+    if not start_time:
+        return ""
+    end = (end_time or start_time + timedelta(hours=1)) + LOG_WINDOW_TAIL
+    return f"{_log_timestamp(start_time)}/{_log_timestamp(end)}"
+
+
+def _log_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _cloud_logging_url(
+    project_id: str,
+    target: str,
+    execution_name: str,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+) -> str:
+    """Build a Logs Explorer URL filtered to this execution.
+
+    Terms are newline separated and fully percent-encoded: the filter travels
+    in a path segment, so an unescaped '/' would truncate it.
+    """
+    terms = [
+        'resource.type="cloud_run_job"',
+        f'resource.labels.job_name="{target}"',
+    ]
+    location = _location_from_execution_name(execution_name)
+    if location:
+        terms.append(f'resource.labels.location="{location}"')
+    terms.append(
+        f'labels."run.googleapis.com/execution_name"="{_execution_id(execution_name)}"'
     )
-    return (
-        f"https://console.cloud.google.com/logs/query;"
-        f"query={urllib.parse.quote(query)}?project={project_id}"
+
+    url = (
+        "https://console.cloud.google.com/logs/query;"
+        f"query={urllib.parse.quote(chr(10).join(terms), safe='')}"
     )
+    window = _log_time_range(start_time, end_time)
+    if window:
+        url += f";timeRange={urllib.parse.quote(window, safe='')}"
+    return f"{url}?project={project_id}"
 
 
 def fetch_execution_logs(
@@ -669,23 +730,42 @@ def fetch_execution_logs(
     """
     client = cloud_logging.Client(project=project_id)
 
-    execution_id = execution_name.rsplit("/", 1)[-1] if "/" in execution_name else execution_name
+    stdout_log = f"projects/{project_id}/logs/{STDOUT_LOG_ID}"
+    stderr_log = f"projects/{project_id}/logs/{STDERR_LOG_ID}"
     filter_str = (
         f'resource.type="cloud_run_job" '
         f'resource.labels.job_name="{target}" '
-        f'labels."run.googleapis.com/execution_name"="{execution_id}"'
+        f'labels."run.googleapis.com/execution_name"="{_execution_id(execution_name)}" '
+        f'logName=("{stdout_log}" OR "{stderr_log}")'
     )
 
     stdout_lines = []
     stderr_lines = []
     for entry in client.list_entries(filter_=filter_str, order_by="timestamp asc"):
-        text = entry.payload if isinstance(entry.payload, str) else str(entry.payload)
-        if entry.severity and entry.severity.upper() in ("ERROR", "CRITICAL", "WARNING"):
+        text = _log_entry_text(entry)
+        if not text:
+            continue
+        if (entry.log_name or "").endswith(STDERR_LOG_ID):
             stderr_lines.append(text)
         else:
             stdout_lines.append(text)
 
     return "\n".join(stdout_lines), "\n".join(stderr_lines)
+
+
+def _log_entry_text(entry) -> str:
+    """Render a log entry payload as the line the script actually emitted."""
+    payload = entry.payload
+    if payload is None:
+        return ""
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, Mapping):
+        message = payload.get("message")
+        if isinstance(message, str):
+            return message
+        return json.dumps(dict(payload), default=str, sort_keys=True)
+    return str(payload)
 
 
 def _is_execution_completed(execution: run_v2.Execution) -> bool:
@@ -717,7 +797,13 @@ def fetch_latest_logs(
     if latest_completed is None:
         raise ValueError(f"No completed executions found for job {target}")
 
-    logs_url = _cloud_logging_url(project_id, target, latest_completed.name)
+    logs_url = _cloud_logging_url(
+        project_id,
+        target,
+        latest_completed.name,
+        start_time=latest_completed.start_time or None,
+        end_time=latest_completed.completion_time or None,
+    )
     stdout, stderr = fetch_execution_logs(project_id, target, latest_completed.name)
     return stdout, stderr, logs_url
 
