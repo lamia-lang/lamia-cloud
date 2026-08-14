@@ -401,11 +401,12 @@ class TestFetchExecutionLogs:
         mock_client = MagicMock()
         mock_client.list_entries.return_value = entries
         mock_client_cls.return_value = mock_client
-        result = fetch_execution_logs(
-            project_id="proj",
-            target="lamia-task",
-            execution_name="projects/p/locations/l/jobs/j/executions/exec-1",
-        )
+        with patch("lamia_cloud.gcp.deployer.time.sleep"):
+            result = fetch_execution_logs(
+                project_id="proj",
+                target="lamia-task",
+                execution_name="projects/p/locations/l/jobs/j/executions/exec-1",
+            )
         return result, mock_client
 
     @patch("lamia_cloud.gcp.deployer.cloud_logging.Client")
@@ -456,6 +457,61 @@ class TestFetchExecutionLogs:
         (stdout, _), _ = self._fetch(mock_client_cls, entries)
 
         assert stdout == "kept"
+
+    @patch("lamia_cloud.gcp.deployer.time.sleep")
+    @patch("lamia_cloud.gcp.deployer.cloud_logging.Client")
+    def test_retries_when_logging_has_not_ingested_yet(self, mock_client_cls, mock_sleep):
+        mock_client = MagicMock()
+        late = [self._entry("late but here")]
+        mock_client.list_entries.side_effect = [[], late, late]
+        mock_client_cls.return_value = mock_client
+
+        stdout, stderr = fetch_execution_logs(
+            project_id="proj",
+            target="lamia-task",
+            execution_name="projects/p/locations/l/jobs/j/executions/exec-1",
+        )
+
+        assert stdout == "late but here"
+        assert mock_client.list_entries.call_count == 3
+        assert mock_sleep.call_count == 2
+
+    @patch("lamia_cloud.gcp.deployer.time.sleep")
+    @patch("lamia_cloud.gcp.deployer.cloud_logging.Client")
+    def test_does_not_return_partial_result_while_logs_are_still_growing(
+        self, mock_client_cls, mock_sleep
+    ):
+        line1 = [self._entry("line1")]
+        line1_and_2 = [self._entry("line1"), self._entry("line2")]
+        mock_client = MagicMock()
+        mock_client.list_entries.side_effect = [line1, line1_and_2, line1_and_2]
+        mock_client_cls.return_value = mock_client
+
+        stdout, _ = fetch_execution_logs(
+            project_id="proj",
+            target="lamia-task",
+            execution_name="projects/p/locations/l/jobs/j/executions/exec-1",
+        )
+
+        assert stdout == "line1\nline2"
+        assert mock_client.list_entries.call_count == 3
+
+    @patch("lamia_cloud.gcp.deployer.time.sleep")
+    @patch("lamia_cloud.gcp.deployer.cloud_logging.Client")
+    def test_gives_up_empty_after_max_attempts(self, mock_client_cls, mock_sleep):
+        mock_client = MagicMock()
+        mock_client.list_entries.return_value = []
+        mock_client_cls.return_value = mock_client
+
+        stdout, stderr = fetch_execution_logs(
+            project_id="proj",
+            target="lamia-task",
+            execution_name="projects/p/locations/l/jobs/j/executions/exec-1",
+        )
+
+        assert (stdout, stderr) == ("", "")
+        assert mock_client.list_entries.call_count == 5
+        assert mock_sleep.call_count == 4
 
 
 class _FakeBlob:
@@ -775,6 +831,27 @@ class TestRunJob:
         assert result["execution_name"] == execution.name
         assert "my-project" in result["logs_url"]
         assert "lamia-hello" in result["logs_url"]
+        assert result["pending_seconds"] is None
+        assert result["running_seconds"] is None
+
+    def test_result_from_execution_splits_pending_and_running_time(self):
+        from datetime import datetime, timedelta, timezone
+        from google.cloud import run_v2
+
+        created = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        started = created + timedelta(seconds=80)
+        completed = started + timedelta(seconds=20)
+
+        execution = run_v2.Execution(
+            name="projects/p/locations/us-central1/jobs/lamia-hello/executions/exec-1",
+            succeeded_count=1,
+            create_time=created,
+            completion_time=completed,
+            conditions=[run_v2.Condition(type_="Started", last_transition_time=started)],
+        )
+        result = _result_from_execution("my-project", "lamia-hello", execution)
+        assert result["pending_seconds"] == 80.0
+        assert result["running_seconds"] == 20.0
 
 class TestEnsureApisEnabled:
     @staticmethod

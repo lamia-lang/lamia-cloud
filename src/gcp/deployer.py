@@ -67,6 +67,11 @@ STDERR_LOG_ID = "run.googleapis.com%2Fstderr"
 # Logs can land slightly after an execution reports completion.
 LOG_WINDOW_TAIL = timedelta(minutes=5)
 
+# Cloud Logging ingestion lags a completed execution by a few seconds,
+# most noticeably right after a fresh deploy. Retry before giving up empty.
+LOG_FETCH_MAX_ATTEMPTS = 5
+LOG_FETCH_RETRY_DELAY_SECONDS = 3.0
+
 _REQUIRED_GCP_APIS = (
     "serviceusage.googleapis.com",
     "cloudscheduler.googleapis.com",
@@ -616,6 +621,19 @@ def _result_from_execution(
     if execution.completion_time and execution.start_time:
         elapsed = (execution.completion_time - execution.start_time).total_seconds()
 
+    started_time = None
+    for condition in execution.conditions:
+        if condition.type_ == "Started" and condition.last_transition_time:
+            started_time = condition.last_transition_time
+            break
+
+    pending_seconds = None
+    running_seconds = None
+    if started_time and execution.create_time:
+        pending_seconds = (started_time - execution.create_time).total_seconds()
+    if started_time and execution.completion_time:
+        running_seconds = (execution.completion_time - started_time).total_seconds()
+
     logs_url = _cloud_logging_url(
         project_id,
         target,
@@ -627,6 +645,8 @@ def _result_from_execution(
     return {
         "exit_code": exit_code,
         "elapsed_seconds": elapsed,
+        "pending_seconds": pending_seconds,
+        "running_seconds": running_seconds,
         "logs_url": logs_url,
         "execution_name": execution.name,
     }
@@ -739,6 +759,12 @@ def fetch_execution_logs(
 ) -> tuple[str, str]:
     """Fetch stdout and stderr from Cloud Logging for a completed execution.
 
+    Cloud Logging has no signal for "ingestion is complete" -- entries can
+    keep arriving over several seconds after an execution finishes. Polls
+    until two consecutive reads agree (or the attempt budget runs out)
+    instead of trusting the first sign of content, since a growing result
+    means more is still coming.
+
     Returns (stdout, stderr) as strings.
     """
     client = cloud_logging.Client(project=project_id)
@@ -752,18 +778,31 @@ def fetch_execution_logs(
         f'logName=("{stdout_log}" OR "{stderr_log}")'
     )
 
-    stdout_lines = []
-    stderr_lines = []
-    for entry in client.list_entries(filter_=filter_str, order_by="timestamp asc"):
-        text = _log_entry_text(entry)
-        if not text:
-            continue
-        if (entry.log_name or "").endswith(STDERR_LOG_ID):
-            stderr_lines.append(text)
-        else:
-            stdout_lines.append(text)
+    def _query() -> tuple[list[str], list[str]]:
+        stdout_lines = []
+        stderr_lines = []
+        for entry in client.list_entries(filter_=filter_str, order_by="timestamp asc"):
+            text = _log_entry_text(entry)
+            if not text:
+                continue
+            if (entry.log_name or "").endswith(STDERR_LOG_ID):
+                stderr_lines.append(text)
+            else:
+                stdout_lines.append(text)
+        return stdout_lines, stderr_lines
 
-    return "\n".join(stdout_lines), "\n".join(stderr_lines)
+    previous = None
+    for attempt in range(LOG_FETCH_MAX_ATTEMPTS):
+        current = _query()
+        is_last_attempt = attempt == LOG_FETCH_MAX_ATTEMPTS - 1
+        has_content = current != ([], [])
+        if is_last_attempt or (has_content and current == previous):
+            stdout_lines, stderr_lines = current
+            return "\n".join(stdout_lines), "\n".join(stderr_lines)
+        previous = current
+        time.sleep(LOG_FETCH_RETRY_DELAY_SECONDS)
+
+    return "", ""
 
 
 def _log_entry_text(entry) -> str:

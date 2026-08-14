@@ -159,13 +159,21 @@ class CloudDeployer(ABC):
     def run_job(self, target: str, verbose: bool = False) -> dict:
         """Execute a deployed job and wait for completion.
 
-        Returns dict with at least: exit_code, elapsed_seconds, logs_url, execution_name.
+        Returns dict with at least: exit_code, elapsed_seconds, logs_url,
+        execution_name. May also include pending_seconds and running_seconds
+        (both None if unavailable) splitting elapsed_seconds into platform
+        scheduling time and actual container execution time.
         """
         ...
 
     @abstractmethod
     def fetch_execution_logs(self, target: str, execution_name: str = "") -> tuple[str, str]:
-        """Retrieve stdout and stderr from a completed execution."""
+        """Retrieve stdout and stderr from a completed execution.
+
+        Cloud Logging has no "ingestion complete" signal, so implementations
+        should poll until the result stabilizes rather than trusting the
+        first read.
+        """
         ...
 
     @abstractmethod
