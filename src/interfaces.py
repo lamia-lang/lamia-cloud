@@ -7,7 +7,7 @@ and CloudTriggerProvider (event-driven triggers).
 """
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set, Tuple
 
 from lamia_cloud.types import (
     CloudLLMRequest,
@@ -20,6 +20,12 @@ from lamia_cloud.types import (
 
 class CloudLLM(ABC):
     """Abstract cloud LLM that provides text generation via a cloud endpoint."""
+
+    @classmethod
+    @abstractmethod
+    def from_config(cls, cloud_cfg: dict) -> "CloudLLM":
+        """Create instance from config.yaml's cloud section (project_id, region, etc.)."""
+        ...
 
     @abstractmethod
     def is_available(self) -> bool:
@@ -35,6 +41,32 @@ class CloudLLM(ABC):
     async def close(self) -> None:
         """Release any resources held by the LLM client."""
         ...
+
+    def check_model_access(self, models: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+        """Return the subset of (provider, model) pairs this account can't call yet.
+
+        Default: no extra access gate beyond normal auth, so nothing is
+        blocked. Providers whose catalog requires a separate per-model
+        consent step (e.g. GCP Vertex AI's Model Garden for third-party
+        models) override this.
+        """
+        return []
+
+    def catalog_display_name(self, provider: str, model: str) -> str:
+        """Best-effort human-readable catalog name for `model`, for error messages.
+
+        Default: the model id itself. Providers whose catalog UI lists
+        models under different display names than the API model id
+        override this.
+        """
+        return model
+
+    def model_catalog_url(self) -> Optional[str]:
+        """URL where a user can grant/manage model access for this project.
+
+        Default: None, for providers with no separate model catalog UI.
+        """
+        return None
 
 
 class CloudScheduler(ABC):
@@ -135,6 +167,23 @@ class CloudDeployer(ABC):
     def set_deployed_source_hash(self, target: str, hash_val: str) -> None:
         """Store a source hash on a deployed resource."""
         ...
+
+    def get_verified_model_access(self) -> Set[Tuple[str, str]]:
+        """(provider, model) pairs already confirmed callable for this project.
+
+        Default: empty, so every model is (re-)checked live. Providers with a
+        way to persist this against the project itself (e.g. GCP project
+        labels) override this so the result is shared across every team
+        member and CI run against that project, not just one checkout.
+        """
+        return set()
+
+    def remember_verified_model_access(self, models: Set[Tuple[str, str]]) -> None:
+        """Record (provider, model) pairs just confirmed accessible.
+
+        Default: no-op. See get_verified_model_access.
+        """
+        pass
 
     @abstractmethod
     def sync_runtime_files(self, entries: list) -> dict:

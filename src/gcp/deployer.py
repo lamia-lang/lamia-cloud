@@ -52,6 +52,7 @@ from lamia_cloud.contracts import (
     sanitize_label_value,
 )
 from lamia_cloud.file_sync import file_sha256
+from lamia_cloud.gcp.llm.vertex import get_verified_vertex_models, remember_verified_vertex_models
 
 logger = logging.getLogger(__name__)
 
@@ -1186,6 +1187,12 @@ class GCPDeployer(CloudDeployer):
 
     def set_deployed_source_hash(self, target: str, hash_val: str) -> None:
         set_deployed_source_hash(self.project_id, self.location, target, hash_val)
+
+    def get_verified_model_access(self) -> set:
+        return get_verified_vertex_models(self.project_id)
+
+    def remember_verified_model_access(self, models: set) -> None:
+        remember_verified_vertex_models(self.project_id, models)
 
     def sync_runtime_files(self, entries: list) -> dict:
         return sync_runtime_files(

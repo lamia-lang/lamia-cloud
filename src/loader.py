@@ -7,8 +7,8 @@ instances of CloudScheduler, CloudDeployer, and CloudTriggerProvider.
 import yaml
 from pathlib import Path
 
-from lamia_cloud.interfaces import CloudDeployer, CloudScheduler, CloudTriggerProvider, RepositoryConnector
-from lamia_cloud.gcp import GCPCloudScheduler, GCPDeployer, GCPRepositoryConnector, GCPTriggerProvider
+from lamia_cloud.interfaces import CloudDeployer, CloudLLM, CloudScheduler, CloudTriggerProvider, RepositoryConnector
+from lamia_cloud.gcp import GCPCloudScheduler, GCPDeployer, GCPRepositoryConnector, GCPTriggerProvider, VertexLLM
 
 _SCHEDULERS = {
     "gcp": GCPCloudScheduler,
@@ -16,6 +16,10 @@ _SCHEDULERS = {
 
 _DEPLOYERS = {
     "gcp": GCPDeployer,
+}
+
+_LLMS = {
+    "gcp": VertexLLM,
 }
 
 _CONNECTORS = {
@@ -88,4 +92,11 @@ def get_trigger_provider(project_root: Path) -> CloudTriggerProvider:
     """Return a configured CloudTriggerProvider for the project."""
     cloud_cfg = _load_cloud_cfg(project_root)
     cls = _resolve_provider(_TRIGGER_PROVIDERS, cloud_cfg, "trigger provider")
+    return cls.from_config(cloud_cfg)
+
+
+def get_llm_router(project_root: Path) -> CloudLLM:
+    """Return a CloudLLM configured for the project at `project_root`."""
+    cloud_cfg = _load_cloud_cfg(project_root)
+    cls = _resolve_provider(_LLMS, cloud_cfg, "LLM")
     return cls.from_config(cloud_cfg)

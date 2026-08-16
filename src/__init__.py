@@ -2,6 +2,7 @@
 
 Public API:
     get_cloud_llm() -> CloudLLM
+    get_llm_router(project_root) -> CloudLLM
     get_scheduler(project_root) -> CloudScheduler
     get_deployer(project_root) -> CloudDeployer
     get_trigger_provider(project_root) -> CloudTriggerProvider
@@ -19,7 +20,7 @@ from lamia_cloud.types import (
     TriggerDeploymentPlan,
 )
 from lamia_cloud.gcp import VertexLLM, is_on_gcp
-from lamia_cloud.loader import get_connector, get_deployer, get_scheduler, get_trigger_provider
+from lamia_cloud.loader import get_connector, get_deployer, get_llm_router, get_scheduler, get_trigger_provider
 from lamia_cloud.gcp.deployer import ensure_apis_enabled
 from lamia_cloud.gcp.connect import (
     ci_sa_email,
@@ -81,6 +82,7 @@ __all__ = [
     "get_cloud_llm",
     "get_connector",
     "get_deployer",
+    "get_llm_router",
     "get_scheduler",
     "get_trigger_provider",
     "RepositoryConnector",

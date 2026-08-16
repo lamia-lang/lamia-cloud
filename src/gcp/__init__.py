@@ -2,9 +2,14 @@
 
 from lamia_cloud.gcp.connect import GCPRepositoryConnector
 from lamia_cloud.gcp.deployer import GCPDeployer
+from lamia_cloud.gcp.llm import (
+    VertexLLM,
+    get_verified_vertex_models,
+    is_on_gcp,
+    remember_verified_vertex_models,
+)
 from lamia_cloud.gcp.scheduler import GCPCloudScheduler
 from lamia_cloud.gcp.trigger_provider import GCPTriggerProvider
-from lamia_cloud.gcp.vertex import VertexLLM, is_on_gcp
 
 __all__ = [
     "GCPCloudScheduler",
@@ -12,5 +17,7 @@ __all__ = [
     "GCPRepositoryConnector",
     "GCPTriggerProvider",
     "VertexLLM",
+    "get_verified_vertex_models",
     "is_on_gcp",
+    "remember_verified_vertex_models",
 ]

@@ -348,7 +348,7 @@ Scheduler expression and is normalized to hourly there.
 - Authentication: IAM-based via service account.
 - Anthropic/Google models run natively on Vertex AI.
 - OpenAI models are mapped to equivalent-tier Gemini models.
-- See `vertex.py` for the dynamic model mapping logic.
+- See `llm/vertex.py` for the dynamic model mapping logic and `llm/anthropic_mapper.py` for Anthropic model id parsing, catalog display naming, and version selection.
 
 ---
 
@@ -364,7 +364,10 @@ src/gcp/
 ├── scheduler_job.py        ← Cloud Scheduler job construction (shared by scheduler + triggers)
 ├── trigger_provider.py     ← Trigger orchestration (Eventarc, Workflows, Pub/Sub)
 ├── workflow_generator.py   ← YAML generation for Workflows (reactive + drain)
-└── vertex.py               ← Vertex AI LLM routing
+└── llm/                    ← Vertex AI LLM routing
+    ├── __init__.py         ← exports VertexLLM, is_on_gcp, get_verified_vertex_models, etc.
+    ├── vertex.py           ← Vertex AI request/response handling, model discovery, provider routing
+    └── anthropic_mapper.py ← Anthropic model id parsing, catalog display naming, version selection
 ```
 
 ---

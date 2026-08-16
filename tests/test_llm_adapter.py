@@ -4,7 +4,7 @@ import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
 import aiohttp
 
-from lamia_cloud.gcp.vertex import (
+from lamia_cloud.gcp.llm.vertex import (
     VertexLLM,
     is_on_gcp,
     _get_project_id,
@@ -19,9 +19,9 @@ from lamia_cloud import get_cloud_llm, is_on_cloud
 class TestVertexLLMClassMethods:
     def test_is_available_delegates_to_is_on_gcp(self):
         llm = VertexLLM()
-        with patch("lamia_cloud.gcp.vertex.is_on_gcp", return_value=True):
+        with patch("lamia_cloud.gcp.llm.vertex.is_on_gcp", return_value=True):
             assert llm.is_available() is True
-        with patch("lamia_cloud.gcp.vertex.is_on_gcp", return_value=False):
+        with patch("lamia_cloud.gcp.llm.vertex.is_on_gcp", return_value=False):
             assert llm.is_available() is False
 
 
@@ -50,7 +50,7 @@ class TestVertexLLMGenerate:
         )
 
     @pytest.mark.asyncio
-    @patch("lamia_cloud.gcp.vertex._get_access_token", return_value="fake-token")
+    @patch("lamia_cloud.gcp.llm.vertex._get_access_token", return_value="fake-token")
     async def test_generate_success(self, mock_token, llm, llm_request):
         mock_response = AsyncMock()
         mock_response.status = 200
@@ -79,7 +79,7 @@ class TestVertexLLMGenerate:
         assert ":rawPredict" in url
 
     @pytest.mark.asyncio
-    @patch("lamia_cloud.gcp.vertex._get_access_token", return_value="fake-token")
+    @patch("lamia_cloud.gcp.llm.vertex._get_access_token", return_value="fake-token")
     async def test_generate_openai_model_uses_google_publisher(self, mock_token, llm):
         request = CloudLLMRequest(prompt="test", model="gpt-4o", provider="openai", max_tokens=500)
 
@@ -102,7 +102,7 @@ class TestVertexLLMGenerate:
         assert "publishers/google" in url
 
     @pytest.mark.asyncio
-    @patch("lamia_cloud.gcp.vertex._get_access_token", return_value="fake-token")
+    @patch("lamia_cloud.gcp.llm.vertex._get_access_token", return_value="fake-token")
     async def test_generate_api_error(self, mock_token, llm, llm_request):
         mock_response = AsyncMock()
         mock_response.status = 400
@@ -177,6 +177,6 @@ class TestPublicAPI:
         llm = get_cloud_llm()
         assert isinstance(llm, VertexLLM)
 
-    @patch("lamia_cloud.gcp.vertex.is_on_gcp", return_value=False)
+    @patch("lamia_cloud.gcp.llm.vertex.is_on_gcp", return_value=False)
     def test_is_on_cloud_false_locally(self, mock):
         assert is_on_cloud() is False
