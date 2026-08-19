@@ -45,9 +45,9 @@ ANTHROPIC_DEFAULT_REGION = "global"
 ANTHROPIC_UNAVAILABLE_REGIONS = frozenset({"us-central1"})
 FALLBACK_GEMINI_MODELS = {
     # Used only when model listing is unavailable.
-    "strong": "gemini-3.1-pro-preview",
-    "medium": "gemini-3.5-flash",
-    "light": "gemini-3.1-flash-lite",
+    "strong": "gemini-2.5-pro",
+    "medium": "gemini-2.5-flash",
+    "light": "gemini-2.5-flash-lite",
 }
 OPENAI_MODEL_FAMILIES = {
     "strong": (
@@ -324,6 +324,23 @@ class VertexLLM(CloudLLM):
                             raise RuntimeError(
                                 f"Vertex AI error ({retry_response.status}): {error_text}"
                             )
+
+                if (
+                    response.status == 404
+                    and "was not found" in error_text
+                    and request.provider != "google"
+                ):
+                    enabled = await self._auto_enable_partner_model(
+                        request.provider, request.model
+                    )
+                    if enabled:
+                        async with self._session.post(
+                            url, json=payload, headers=headers
+                        ) as retry_response:
+                            if retry_response.status == 200:
+                                data = await retry_response.json()
+                                return self._parse_response(data, request)
+                            error_text = await retry_response.text()
 
                 self._handle_api_error(response.status, error_text, request)
                 raise RuntimeError(f"Vertex AI error ({response.status}): {error_text}")
@@ -653,7 +670,11 @@ class VertexLLM(CloudLLM):
     async def _check_gated_access(
         self, pairs: list[tuple[str, str]]
     ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-        """Check Model Garden access for Anthropic and MaaS partner models."""
+        """Check Model Garden access for Anthropic and MaaS partner models.
+
+        When a model is not accessible, attempts to auto-enable its
+        Cloud Partner Service before reporting it as missing.
+        """
         try:
             resolved_pairs = []
             for provider, model in pairs:
@@ -670,11 +691,101 @@ class VertexLLM(CloudLLM):
             results = await asyncio.gather(
                 *(self._probe_model_access(provider, model) for provider, model in resolved_pairs)
             )
+
+            # Auto-enable partner services for models that returned 404
+            inaccessible = [
+                (i, pair) for i, (pair, accessible) in enumerate(zip(resolved_pairs, results))
+                if accessible is False
+            ]
+            if inaccessible:
+                results = list(results)
+                for idx, (provider, model) in inaccessible:
+                    enabled = await self._auto_enable_partner_model(provider, model)
+                    if enabled:
+                        re_probe = await self._probe_model_access(provider, model)
+                        if re_probe is True:
+                            results[idx] = True
         finally:
             await self.close()
         missing = [pair for pair, accessible in zip(resolved_pairs, results) if accessible is False]
         verified = [pair for pair, accessible in zip(resolved_pairs, results) if accessible is True]
         return missing, verified
+
+    async def _get_partner_service_name(self, provider: str, model: str) -> Optional[str]:
+        """Extract the Cloud Partner Service name for a Model Garden model.
+
+        Fetches model metadata and parses the ``requestAccess`` URI for the
+        ``service=`` parameter (e.g. ``mistral-small-2503.cloudpartnerservices.goog``).
+        Returns None for Google models or if the metadata doesn't include service info.
+        """
+        if provider == "google":
+            return None
+        try:
+            publisher = _resolve_publisher(provider)
+            url = (
+                f"https://us-central1-aiplatform.googleapis.com/v1beta1/"
+                f"publishers/{publisher}/models/{model}"
+            )
+            token = _get_access_token()
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "x-goog-user-project": self.project_id,
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        return None
+                    data = await response.json()
+            access_refs = (
+                data.get("supportedActions", {})
+                .get("requestAccess", {})
+                .get("references", {})
+            )
+            for region_info in access_refs.values():
+                uri = region_info.get("uri", "")
+                for param in uri.split("&"):
+                    if param.startswith("service="):
+                        return param.split("=", 1)[1]
+        except Exception:
+            pass
+        return None
+
+    async def _auto_enable_partner_model(self, provider: str, model: str) -> bool:
+        """Try to enable a partner model's Cloud Partner Service via the Service Usage API.
+
+        Returns True if the service was enabled (or already enabled), False on failure.
+        """
+        service_name = await self._get_partner_service_name(provider, model)
+        if not service_name:
+            return False
+
+        logger.info(f"Auto-enabling Model Garden service: {service_name}")
+
+        url = (
+            f"https://serviceusage.googleapis.com/v1/"
+            f"projects/{self.project_id}/services/{service_name}:enable"
+        )
+        token = _get_access_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json={}, headers=headers) as response:
+                    if response.status == 200:
+                        logger.info(f"Enabled {service_name} for project {self.project_id}")
+                        await asyncio.sleep(2)
+                        return True
+                    else:
+                        error = await response.text()
+                        logger.warning(
+                            f"Could not auto-enable {service_name}: "
+                            f"HTTP {response.status} — {error[:200]}"
+                        )
+        except Exception as exc:
+            logger.warning(f"Could not auto-enable {service_name}: {exc}")
+        return False
 
     async def _probe_model_access(self, provider: str, model: str) -> Optional[bool]:
         """Return whether this project can call `model`, without logging or opening a browser.
@@ -706,7 +817,7 @@ class VertexLLM(CloudLLM):
             if response.status == 200:
                 return True
             if response.status == 404:
-                error_text = await response.text()
-                if "was not found" in error_text:
+                body = await response.text()
+                if "was not found" in body or "no access" in body:
                     return False
             return None
