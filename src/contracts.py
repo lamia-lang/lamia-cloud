@@ -22,6 +22,10 @@ LABEL_DEPLOY_MODE = "lamia-deploy-mode"
 LABEL_REPO_URL = "lamia-repo-url"
 LABEL_RESOURCE_TYPE = "lamia-resource-type"
 
+CLOUD_TASK_TIMEOUT_DEFAULT_SECONDS = 3600
+CLOUD_TASK_TIMEOUT_MIN_SECONDS = 1
+CLOUD_TASK_TIMEOUT_MAX_SECONDS = 604800  # 7 days (Cloud Run Jobs limit)
+
 STALE_RESOURCE_DAYS = 30
 
 _LABEL_CLEAN_RE = re.compile(r"[^a-z0-9_-]")

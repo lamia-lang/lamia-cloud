@@ -40,6 +40,9 @@ from google.cloud.devtools import cloudbuild_v1
 from google.iam.v1 import policy_pb2
 
 from lamia_cloud.contracts import (
+    CLOUD_TASK_TIMEOUT_DEFAULT_SECONDS,
+    CLOUD_TASK_TIMEOUT_MAX_SECONDS,
+    CLOUD_TASK_TIMEOUT_MIN_SECONDS,
     LABEL_DEPLOY_MODE,
     LABEL_LAST_USED,
     LABEL_MANAGED,
@@ -513,6 +516,7 @@ def deploy_job(
     files_bucket: Optional[str] = None,
     extra_labels: dict[str, str] | None = None,
     exec_service_account: Optional[str] = None,
+    task_timeout_seconds: int = CLOUD_TASK_TIMEOUT_DEFAULT_SECONDS,
 ) -> None:
     """Deploy (or update) a Cloud Run Job.
 
@@ -572,7 +576,7 @@ def deploy_job(
                 volumes=volumes,
                 service_account=service_account,
                 max_retries=0,
-                timeout={"seconds": 3600},
+                timeout={"seconds": task_timeout_seconds},
             ),
         ),
         labels=merged_labels,
@@ -963,6 +967,7 @@ def deploy(
     uses_files: bool = False,
     deploy_mode: str = "local",
     repo_url: str | None = None,
+    task_timeout_seconds: int = CLOUD_TASK_TIMEOUT_DEFAULT_SECONDS,
 ) -> str:
     """Full deploy pipeline. Returns the deployment name.
 
@@ -1038,6 +1043,7 @@ def deploy(
             files_bucket=files_bucket,
             extra_labels=resource_labels,
             exec_service_account=run_sa,
+            task_timeout_seconds=task_timeout_seconds,
         )
 
         return job_name
@@ -1161,9 +1167,16 @@ from lamia_cloud.interfaces import CloudDeployer
 class GCPDeployer(CloudDeployer):
     """GCP implementation of CloudDeployer using Cloud Build + Cloud Run Jobs."""
 
-    def __init__(self, *, project_id: str, location: str):
+    def __init__(
+        self,
+        *,
+        project_id: str,
+        location: str,
+        task_timeout_seconds: int = CLOUD_TASK_TIMEOUT_DEFAULT_SECONDS,
+    ):
         self.project_id = project_id
         self.location = location
+        self.task_timeout_seconds = task_timeout_seconds
 
     @classmethod
     def from_config(cls, cloud_cfg: dict) -> "GCPDeployer":
@@ -1171,7 +1184,25 @@ class GCPDeployer(CloudDeployer):
         if not project_id:
             raise ValueError("cloud.project_id is required in config.yaml.")
         location = cloud_cfg.get("location", "us-central1")
-        return cls(project_id=project_id, location=location)
+        resources_cfg = cloud_cfg.get("resources", {})
+        timeout = resources_cfg.get(
+            "task_timeout_seconds",
+            CLOUD_TASK_TIMEOUT_DEFAULT_SECONDS,
+        )
+        try:
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            raise ValueError("cloud.resources.task_timeout_seconds must be an integer.")
+        if timeout < CLOUD_TASK_TIMEOUT_MIN_SECONDS or timeout > CLOUD_TASK_TIMEOUT_MAX_SECONDS:
+            raise ValueError(
+                f"cloud.resources.task_timeout_seconds must be between "
+                f"{CLOUD_TASK_TIMEOUT_MIN_SECONDS} and {CLOUD_TASK_TIMEOUT_MAX_SECONDS}."
+            )
+        return cls(
+            project_id=project_id,
+            location=location,
+            task_timeout_seconds=timeout,
+        )
 
     def ensure_apis_enabled(self) -> None:
         ensure_apis_enabled(self.project_id)
@@ -1221,6 +1252,7 @@ class GCPDeployer(CloudDeployer):
             uses_files=uses_files,
             deploy_mode=deploy_mode,
             repo_url=repo_url,
+            task_timeout_seconds=self.task_timeout_seconds,
         )
 
     def run_job(self, target: str, verbose: bool = False) -> dict:

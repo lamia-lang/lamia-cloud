@@ -927,3 +927,29 @@ class TestEnsureApisEnabled:
         mock_client.batch_enable_services.assert_called_once()
 
 
+class TestGCPDeployerTimeoutConfig:
+    def test_from_config_uses_default_timeout(self):
+        deployer = deployer_module.GCPDeployer.from_config(
+            {"project_id": "my-project", "location": "us-central1"}
+        )
+        assert deployer.task_timeout_seconds == 3600
+
+    def test_from_config_accepts_custom_timeout(self):
+        deployer = deployer_module.GCPDeployer.from_config(
+            {
+                "project_id": "my-project",
+                "location": "us-central1",
+                "resources": {"task_timeout_seconds": 7200},
+            }
+        )
+        assert deployer.task_timeout_seconds == 7200
+
+    def test_from_config_rejects_out_of_range_timeout(self):
+        with pytest.raises(ValueError, match="task_timeout_seconds must be between"):
+            deployer_module.GCPDeployer.from_config(
+                {
+                    "project_id": "my-project",
+                    "location": "us-central1",
+                    "resources": {"task_timeout_seconds": 700000},
+                }
+            )
