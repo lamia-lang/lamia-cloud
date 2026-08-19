@@ -408,7 +408,7 @@ class TestCheckModelAccess:
         llm._select_anthropic_model = fake_select
         llm._probe_model_access = fake_probe
 
-        missing, verified = llm.check_model_access([
+        missing, verified, suggestions = llm.check_model_access([
             ("anthropic", "claude-sonnet-4-5-20250929"),
             ("anthropic", "claude-opus-4-5-20251101"),
             ("anthropic", "claude-haiku-4-5-20251001"),
@@ -416,29 +416,34 @@ class TestCheckModelAccess:
 
         assert missing == [("anthropic", "claude-opus-4-5-20251101")]
         assert verified == [("anthropic", "claude-sonnet-4-5-20250929")]
-        # The inconclusive pair must appear in neither list.
         for pair_list in (missing, verified):
             assert ("anthropic", "claude-haiku-4-5-20251001") not in pair_list
 
-    def test_google_passes_through_as_verified_untested(self, llm):
-        missing, verified = llm.check_model_access([("google", "gemini-3.5-flash")])
-        assert missing == []
-        assert verified == [("google", "gemini-3.5-flash")]
-
-    def test_any_non_google_provider_is_gated(self, llm):
-        """All non-Google providers are gated by Model Garden."""
+    def test_google_is_probed_like_any_other_provider(self, llm):
         async def fake_probe(provider, model):
             return True
 
         llm._probe_model_access = fake_probe
 
-        missing, verified = llm.check_model_access([
+        missing, verified, _ = llm.check_model_access([("google", "gemini-2.5-flash")])
+        assert missing == []
+        assert verified == [("google", "gemini-2.5-flash")]
+
+    def test_all_providers_are_probed(self, llm):
+        async def fake_probe(provider, model):
+            return True
+
+        llm._probe_model_access = fake_probe
+
+        missing, verified, _ = llm.check_model_access([
+            ("google", "gemini-2.5-flash"),
             ("mistralai", "mistral-small-2503"),
             ("moonshotai", "kimi-k3"),
         ])
         assert missing == []
+        assert ("google", "gemini-2.5-flash") in verified
         assert ("mistralai", "mistral-small-2503") in verified
         assert ("moonshotai", "kimi-k3") in verified
 
     def test_empty_input_returns_empty_lists(self, llm):
-        assert llm.check_model_access([]) == ([], [])
+        assert llm.check_model_access([]) == ([], [], {})

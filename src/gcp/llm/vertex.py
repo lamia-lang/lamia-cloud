@@ -14,6 +14,7 @@ alias table normalises common shorthand names to Vertex publisher ids
 (e.g. "mistral" → "mistralai").
 """
 import asyncio
+import difflib
 import logging
 import os
 import re
@@ -166,6 +167,20 @@ def _extract_version_score(model_id: str) -> tuple[int, int]:
     if not m:
         return (0, 0)
     return (int(m.group(1)), int(m.group(2) or 0))
+
+
+def _model_similarity(requested: str, candidate: str) -> float:
+    """Score how similar two model names are (0..1, higher = better)."""
+    a, b = requested.lower(), candidate.lower()
+    if a == b:
+        return 1.0
+    toks_a = set(re.split(r"[-_.]", a))
+    toks_b = set(re.split(r"[-_.]", b))
+    if not toks_a:
+        return 0.0
+    token_overlap = len(toks_a & toks_b) / max(len(toks_a), len(toks_b))
+    seq_ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    return 0.6 * token_overlap + 0.4 * seq_ratio
 
 
 def _classify_openai_tier(model: str) -> str:
@@ -325,23 +340,6 @@ class VertexLLM(CloudLLM):
                                 f"Vertex AI error ({retry_response.status}): {error_text}"
                             )
 
-                if (
-                    response.status == 404
-                    and "was not found" in error_text
-                    and request.provider != "google"
-                ):
-                    enabled = await self._auto_enable_partner_model(
-                        request.provider, request.model
-                    )
-                    if enabled:
-                        async with self._session.post(
-                            url, json=payload, headers=headers
-                        ) as retry_response:
-                            if retry_response.status == 200:
-                                data = await retry_response.json()
-                                return self._parse_response(data, request)
-                            error_text = await retry_response.text()
-
                 self._handle_api_error(response.status, error_text, request)
                 raise RuntimeError(f"Vertex AI error ({response.status}): {error_text}")
 
@@ -355,23 +353,19 @@ class VertexLLM(CloudLLM):
 
     def check_model_access(
         self, models: list[tuple[str, str]]
-    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-        """All non-Google models are gated by Vertex AI Model Garden.
+    ) -> tuple[
+        list[tuple[str, str]],
+        list[tuple[str, str]],
+        dict[tuple[str, str], list[str]],
+    ]:
+        """Check all models (every provider) for accessibility.
 
-        A pair whose live check comes back inconclusive (e.g. rate-limited)
-        appears in neither returned list.
+        Attempts auto-enable for partner services when possible.
+        Returns (missing, verified, suggestions).
         """
-        gated: list[tuple[str, str]] = []
-        passthrough: list[tuple[str, str]] = []
-        for provider, model in models:
-            if provider == "google":
-                passthrough.append((provider, model))
-            else:
-                gated.append((provider, model))
-        if not gated:
-            return [], passthrough
-        missing, verified = asyncio.run(self._check_gated_access(gated))
-        return missing, verified + passthrough
+        if not models:
+            return [], [], {}
+        return asyncio.run(self._check_all_models(models))
 
     def catalog_display_name(self, provider: str, model: str) -> str:
         if provider != "anthropic":
@@ -406,21 +400,31 @@ class VertexLLM(CloudLLM):
         if publisher in self._publisher_models_cache:
             return self._publisher_models_cache[publisher]
 
-        region = _region_for_provider(publisher, self.configured_region)
-        url = (
-            f"https://{_vertex_endpoint_host(region)}/v1/"
-            f"projects/{self.project_id}/locations/{region}/publishers/{publisher}/models"
-        )
         token = _get_access_token()
-        headers = {"Authorization": f"Bearer {token}"}
+
+        # Two endpoint styles: v1 project-scoped works for Google models,
+        # v1beta1 global works for partner publishers (mistralai, meta, etc.).
+        region = _region_for_provider(publisher, self.configured_region)
+        urls = [
+            (
+                f"https://{_vertex_endpoint_host(region)}/v1/"
+                f"projects/{self.project_id}/locations/{region}/publishers/{publisher}/models",
+                {"Authorization": f"Bearer {token}"},
+            ),
+            (
+                f"https://us-central1-aiplatform.googleapis.com/v1beta1/"
+                f"publishers/{publisher}/models",
+                {"Authorization": f"Bearer {token}", "x-goog-user-project": self.project_id},
+            ),
+        ]
 
         models: list[str] = []
         try:
-            # Use a dedicated short-lived session so model discovery does not
-            # interfere with the request session/mocks used by generate().
             async with aiohttp.ClientSession() as discovery_session:
-                async with discovery_session.get(url, headers=headers) as response:
-                    if response.status == 200:
+                for url, headers in urls:
+                    async with discovery_session.get(url, headers=headers) as response:
+                        if response.status != 200:
+                            continue
                         data = await response.json()
                         raw_models = data.get("publisherModels") or data.get("models") or []
                         for item in raw_models:
@@ -436,6 +440,8 @@ class VertexLLM(CloudLLM):
                                 model_id = name.rsplit("/models/", 1)[-1]
                             if model_id:
                                 models.append(model_id)
+                    if models:
+                        break
         except Exception:
             pass
 
@@ -443,34 +449,42 @@ class VertexLLM(CloudLLM):
         self._publisher_models_cache[publisher] = result
         return result
 
+    def _google_tier_candidates(self, tier: str, available: list[str]) -> list[str]:
+        """Return Gemini model candidates for a tier, sorted best-first.
+
+        Filters out non-text models (tts, embedding, image, etc.) and sorts
+        by version score descending so the newest model comes first.
+        """
+        _SKIP_SUFFIXES = ("tts", "embedding", "image", "audio", "robotics", "computer-use")
+
+        def _is_text_model(m: str) -> bool:
+            return m.startswith("gemini-") and not any(s in m for s in _SKIP_SUFFIXES)
+
+        if tier == "strong":
+            candidates = [m for m in available if _is_text_model(m) and "pro" in m and "preview" not in m]
+            if not candidates:
+                candidates = [m for m in available if _is_text_model(m) and "pro" in m]
+        elif tier == "light":
+            candidates = [m for m in available if _is_text_model(m) and ("flash-lite" in m or "lite" in m)]
+        else:
+            candidates = [m for m in available if _is_text_model(m) and "flash" in m and "lite" not in m]
+
+        candidates.sort(key=_extract_version_score, reverse=True)
+        return candidates
+
     async def _select_google_model_for_tier(self, tier: str) -> str:
         """Select best available Gemini model for the requested tier."""
+        candidates = await self._ranked_google_candidates(tier)
+        return candidates[0] if candidates else FALLBACK_GEMINI_MODELS[tier]
+
+    async def _ranked_google_candidates(self, tier: str) -> list[str]:
+        """Return all Gemini candidates for a tier, best-first, with fallback appended."""
         available = await self._load_publisher_models("google")
-
-        if available:
-            if tier == "strong":
-                candidates = [
-                    m for m in available
-                    if m.startswith("gemini-") and "pro" in m and "preview" not in m
-                ]
-                if not candidates:
-                    candidates = [m for m in available if m.startswith("gemini-") and "pro" in m]
-            elif tier == "light":
-                candidates = [
-                    m for m in available
-                    if m.startswith("gemini-") and ("flash-lite" in m or "lite" in m)
-                ]
-            else:
-                candidates = [
-                    m for m in available
-                    if m.startswith("gemini-") and "flash" in m and "lite" not in m
-                ]
-
-            if candidates:
-                candidates.sort(key=_extract_version_score, reverse=True)
-                return candidates[0]
-
-        return FALLBACK_GEMINI_MODELS[tier]
+        candidates = self._google_tier_candidates(tier, available) if available else []
+        fallback = FALLBACK_GEMINI_MODELS[tier]
+        if fallback not in candidates:
+            candidates.append(fallback)
+        return candidates
 
     async def _select_anthropic_model(self, requested_model: str) -> str:
         """Resolve `requested_model` against Vertex's live Anthropic catalog.
@@ -613,7 +627,9 @@ class VertexLLM(CloudLLM):
         # Preferred Vertex Gemini shape.
         if "candidates" in data:
             candidate = data["candidates"][0]
-            text = candidate["content"]["parts"][0]["text"]
+            content = candidate.get("content", {})
+            parts = content.get("parts", [{}])
+            text = parts[0].get("text", "") if parts else ""
             usage_meta = data.get("usageMetadata", {})
             usage = {
                 "input_tokens": usage_meta.get("promptTokenCount", 0),
@@ -667,13 +683,22 @@ class VertexLLM(CloudLLM):
                 f"Vertex AI API not enabled. Enabling automatically..."
             )
 
-    async def _check_gated_access(
+    async def _check_all_models(
         self, pairs: list[tuple[str, str]]
-    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-        """Check Model Garden access for Anthropic and MaaS partner models.
+    ) -> tuple[
+        list[tuple[str, str]],
+        list[tuple[str, str]],
+        dict[tuple[str, str], list[str]],
+    ]:
+        """Pre-deploy model access check for ALL providers.
 
-        When a model is not accessible, attempts to auto-enable its
-        Cloud Partner Service before reporting it as missing.
+        1. Resolve Anthropic model names against live catalog.
+        2. Probe every model in parallel.
+        3. Auto-enable partner services for inaccessible models.
+        4. Re-probe after enable.
+        5. For still-missing models, suggest closest available names.
+
+        Returns (missing, verified, suggestions).
         """
         try:
             resolved_pairs = []
@@ -688,28 +713,53 @@ class VertexLLM(CloudLLM):
                     resolved_pairs.append(("anthropic", resolved_model))
                 else:
                     resolved_pairs.append((provider, model))
-            results = await asyncio.gather(
-                *(self._probe_model_access(provider, model) for provider, model in resolved_pairs)
-            )
 
-            # Auto-enable partner services for models that returned 404
-            inaccessible = [
-                (i, pair) for i, (pair, accessible) in enumerate(zip(resolved_pairs, results))
-                if accessible is False
+            results = list(await asyncio.gather(
+                *(self._probe_model_access(p, m) for p, m in resolved_pairs)
+            ))
+
+            # Auto-enable partner services for inaccessible models
+            for idx, ((provider, model), accessible) in enumerate(
+                zip(resolved_pairs, results)
+            ):
+                if accessible is not False:
+                    continue
+                enabled = await self._auto_enable_partner_model(provider, model)
+                if enabled:
+                    re_probe = await self._probe_model_access(provider, model)
+                    if re_probe is True:
+                        results[idx] = True
+
+            # Build results
+            missing = [
+                pair for pair, acc in zip(resolved_pairs, results) if acc is False
             ]
-            if inaccessible:
-                results = list(results)
-                for idx, (provider, model) in inaccessible:
-                    enabled = await self._auto_enable_partner_model(provider, model)
-                    if enabled:
-                        re_probe = await self._probe_model_access(provider, model)
-                        if re_probe is True:
-                            results[idx] = True
+            verified = [
+                pair for pair, acc in zip(resolved_pairs, results) if acc is True
+            ]
+
+            # Suggest closest names for missing models
+            suggestions: dict[tuple[str, str], list[str]] = {}
+            for provider, model in missing:
+                try:
+                    publisher = _resolve_publisher(provider)
+                    available = await self._load_publisher_models(publisher)
+                    if not available:
+                        continue
+                    scored = [
+                        (m, _model_similarity(model, m))
+                        for m in available if m != model
+                    ]
+                    scored.sort(key=lambda x: x[1], reverse=True)
+                    top = [m for m, s in scored[:3] if s >= 0.25]
+                    if top:
+                        suggestions[(provider, model)] = top
+                except Exception:
+                    pass
         finally:
             await self.close()
-        missing = [pair for pair, accessible in zip(resolved_pairs, results) if accessible is False]
-        verified = [pair for pair, accessible in zip(resolved_pairs, results) if accessible is True]
-        return missing, verified
+
+        return missing, verified, suggestions
 
     async def _get_partner_service_name(self, provider: str, model: str) -> Optional[str]:
         """Extract the Cloud Partner Service name for a Model Garden model.

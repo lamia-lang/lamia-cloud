@@ -44,19 +44,24 @@ class CloudLLM(ABC):
 
     def check_model_access(
         self, models: List[Tuple[str, str]]
-    ) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    ) -> Tuple[
+        List[Tuple[str, str]],
+        List[Tuple[str, str]],
+        dict[Tuple[str, str], List[str]],
+    ]:
         """Check live access for (provider, model) pairs.
 
-        Returns (confirmed_inaccessible, confirmed_accessible). A pair this
-        call can't confirm either way (e.g. rate-limited) appears in neither
-        list, so callers don't wrongly report or cache it.
+        Returns (missing, verified, suggestions).
+        - missing: confirmed inaccessible pairs.
+        - verified: confirmed accessible pairs.
+        - suggestions: maps each missing pair to closest available model names.
 
-        Default: no extra access gate beyond normal auth, so everything is
-        confirmed accessible. Providers whose catalog requires a separate
-        per-model consent step (e.g. GCP Vertex AI's Model Garden for
-        third-party models) override this.
+        A pair this call can't confirm either way (e.g. rate-limited) appears
+        in neither missing nor verified.
+
+        Default: everything is accessible, no suggestions.
         """
-        return [], list(models)
+        return [], list(models), {}
 
     def catalog_display_name(self, provider: str, model: str) -> str:
         """Best-effort human-readable catalog name for `model`, for error messages.
