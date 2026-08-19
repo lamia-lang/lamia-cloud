@@ -42,15 +42,21 @@ class CloudLLM(ABC):
         """Release any resources held by the LLM client."""
         ...
 
-    def check_model_access(self, models: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-        """Return the subset of (provider, model) pairs this account can't call yet.
+    def check_model_access(
+        self, models: List[Tuple[str, str]]
+    ) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+        """Check live access for (provider, model) pairs.
 
-        Default: no extra access gate beyond normal auth, so nothing is
-        blocked. Providers whose catalog requires a separate per-model
-        consent step (e.g. GCP Vertex AI's Model Garden for third-party
-        models) override this.
+        Returns (confirmed_inaccessible, confirmed_accessible). A pair this
+        call can't confirm either way (e.g. rate-limited) appears in neither
+        list, so callers don't wrongly report or cache it.
+
+        Default: no extra access gate beyond normal auth, so everything is
+        confirmed accessible. Providers whose catalog requires a separate
+        per-model consent step (e.g. GCP Vertex AI's Model Garden for
+        third-party models) override this.
         """
-        return []
+        return [], list(models)
 
     def catalog_display_name(self, provider: str, model: str) -> str:
         """Best-effort human-readable catalog name for `model`, for error messages.

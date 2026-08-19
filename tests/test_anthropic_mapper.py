@@ -1,6 +1,6 @@
 """Tests for Anthropic model id parsing, catalog display naming, and version selection."""
 
-from lamia_cloud.gcp.llm.anthropic_mapper import model_garden_name, select_model
+from lamia_cloud.gcp.llm.anthropic_mapper import model_garden_name, select_model, to_vertex_id
 
 
 class TestModelGardenName:
@@ -24,6 +24,29 @@ class TestModelGardenName:
 
     def test_unparseable_id_falls_back_unchanged(self):
         assert model_garden_name("some-future-shape-v9") == "some-future-shape-v9"
+
+
+class TestToVertexId:
+    def test_current_scheme_date_converted_to_at_sign(self):
+        assert to_vertex_id("claude-haiku-4-5-20251001") == "claude-haiku-4-5@20251001"
+
+    def test_current_scheme_no_minor_date_converted(self):
+        assert to_vertex_id("claude-sonnet-4-20250514") == "claude-sonnet-4@20250514"
+
+    def test_legacy_scheme_date_converted(self):
+        assert to_vertex_id("claude-3-5-haiku-20241022") == "claude-3-5-haiku@20241022"
+
+    def test_legacy_scheme_no_minor_date_converted(self):
+        assert to_vertex_id("claude-3-opus-20240229") == "claude-3-opus@20240229"
+
+    def test_no_date_returned_unchanged(self):
+        assert to_vertex_id("claude-sonnet-5") == "claude-sonnet-5"
+
+    def test_already_at_sign_form_is_idempotent(self):
+        assert to_vertex_id("claude-haiku-4-5@20251001") == "claude-haiku-4-5@20251001"
+
+    def test_unparseable_id_returned_unchanged(self):
+        assert to_vertex_id("not-a-claude-model-20251001") == "not-a-claude-model-20251001"
 
 
 class TestSelectModel:

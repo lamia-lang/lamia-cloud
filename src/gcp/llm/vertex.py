@@ -3,9 +3,15 @@
 Routes LLM calls through Vertex AI using ADC. On Cloud Run, authentication
 is automatic via the metadata server. Locally, uses `gcloud auth application-default login`.
 
-Supports two publisher types:
-- Anthropic (claude-*) → rawPredict endpoint with anthropic_version header
-- Google (gemini-*) → generateContent endpoint with Gemini format
+Three request formats, chosen automatically:
+- Google  → generateContent (Gemini-specific)
+- Anthropic → rawPredict with anthropic_version header (Anthropic-specific)
+- Any other provider → rawPredict with OpenAI-compatible chat completions
+
+No static allowlist: any provider that appears in config.yaml and isn't
+"google" or "anthropic" is sent via the generic rawPredict path.  A small
+alias table normalises common shorthand names to Vertex publisher ids
+(e.g. "mistral" → "mistralai").
 """
 import asyncio
 import logging
@@ -26,7 +32,17 @@ logger = logging.getLogger(__name__)
 
 ANTHROPIC_VERTEX_VERSION = "vertex-2023-10-16"
 DEFAULT_REGION = "us-central1"
-ANTHROPIC_REGIONS = ("us-east5", "europe-west1")
+# Recommended by Google for Claude on Vertex: best availability, no pricing
+# premium (unlike a pinned region or multi-region), and no allowlist of
+# regions to maintain -- any region/multi-region the user configures
+# explicitly is honored as-is in _region_for_provider.
+ANTHROPIC_DEFAULT_REGION = "global"
+
+# Regions confirmed to not serve Anthropic models on Vertex AI. Live-tested:
+# Vertex rejects rawPredict there with "is not servable in region <region>".
+# Independent of DEFAULT_REGION, which is just this codebase's config
+# fallback and can change for unrelated reasons.
+ANTHROPIC_UNAVAILABLE_REGIONS = frozenset({"us-central1"})
 FALLBACK_GEMINI_MODELS = {
     # Used only when model listing is unavailable.
     "strong": "gemini-3.1-pro-preview",
@@ -54,6 +70,18 @@ OPENAI_MODEL_FAMILIES = {
         "gpt-4.1-nano",
         "gpt-3.5",
     ),
+}
+
+# Providers whose models can only be reached via Gemini tier mapping
+# because they have no Vertex AI publisher.  Every other provider —
+# including any future Model Garden partner — goes through rawPredict.
+_NON_VERTEX_PROVIDERS = frozenset({"openai"})
+
+# Normalise common config-level shorthand names to the actual Vertex AI
+# publisher id.  Any provider NOT listed here is used as its own publisher
+# id verbatim — no static allowlist needed.
+PUBLISHER_ALIASES: dict[str, str] = {
+    "mistral": "mistralai",
 }
 
 # Backward-compatible exports used by existing tests/integrations.
@@ -124,8 +152,12 @@ def remember_verified_vertex_models(project_id: str, models: set[tuple[str, str]
 
 
 def _resolve_publisher(provider: str) -> str:
-    """Compatibility helper: map non-anthropic providers to google."""
-    return "anthropic" if provider == "anthropic" else "google"
+    """Map a config-level provider name to its Vertex AI publisher id.
+
+    Applies alias normalisation (e.g. "mistral" → "mistralai"), then
+    returns the provider as-is — every Vertex partner IS its own publisher.
+    """
+    return PUBLISHER_ALIASES.get(provider, provider)
 
 
 def _extract_version_score(model_id: str) -> tuple[int, int]:
@@ -180,12 +212,26 @@ def _get_access_token() -> str:
 
 
 def _region_for_provider(provider: str, configured_region: str) -> str:
-    """Resolve the region based on provider. Anthropic needs specific regions."""
-    if provider == "anthropic":
-        if configured_region in ANTHROPIC_REGIONS:
-            return configured_region
-        return ANTHROPIC_REGIONS[0]
+    """Resolve the region for a provider's Vertex AI calls.
+
+    Anthropic gets routed to ANTHROPIC_DEFAULT_REGION whenever the configured
+    region is one of ANTHROPIC_UNAVAILABLE_REGIONS. Any other region,
+    multi-region ("us"/"eu"), or "global" the user configures explicitly is
+    used as-is -- no allowlist to keep in sync with Google's rollout.
+    """
+    if provider == "anthropic" and configured_region in ANTHROPIC_UNAVAILABLE_REGIONS:
+        return ANTHROPIC_DEFAULT_REGION
     return configured_region
+
+
+def _vertex_endpoint_host(region: str) -> str:
+    """Hostname for a Vertex AI region: global, multi-region ("us"/"eu"), or
+    a specific region (e.g. "us-east5") each use a different host pattern."""
+    if region == "global":
+        return "aiplatform.googleapis.com"
+    if region in ("us", "eu"):
+        return f"aiplatform.{region}.rep.googleapis.com"
+    return f"{region}-aiplatform.googleapis.com"
 
 
 _VERTEX_MODEL_LABEL_PREFIX = "lamia-vertex-model-"
@@ -227,7 +273,6 @@ class VertexLLM(CloudLLM):
         original_provider = request.provider
         original_model = request.model
         request = self._resolve_model(request)
-        is_anthropic = request.provider == "anthropic"
 
         if request.provider == "google" and request.model.startswith("__auto_tier__:"):
             tier = request.model.split(":", 1)[1]
@@ -246,29 +291,7 @@ class VertexLLM(CloudLLM):
                 response_schema=request.response_schema,
             )
 
-        if is_anthropic:
-            resolved_model = await self._select_anthropic_model(request.model)
-            if resolved_model != request.model:
-                # Unlike the OpenAI->Gemini tier mapping above (always-on,
-                # by design), this is a fallback for an exact version that
-                # disappeared -- worth surfacing at warning level so it isn't
-                # missed in default-verbosity logs.
-                logger.warning(
-                    f"Cloud model mapping: anthropic/{request.model} -> "
-                    f"anthropic/{resolved_model} (exact version unavailable)"
-                )
-                request = CloudLLMRequest(
-                    prompt=request.prompt,
-                    model=resolved_model,
-                    provider="anthropic",
-                    max_tokens=request.max_tokens,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    response_schema=request.response_schema,
-                )
-            url, payload = self._build_anthropic_request(request, self._anthropic_version)
-        else:
-            url, payload = self._build_google_request(request)
+        url, payload = self._build_request(request)
 
         token = _get_access_token()
         headers = {
@@ -282,7 +305,8 @@ class VertexLLM(CloudLLM):
         async with self._session.post(url, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
-                if is_anthropic:
+
+                if request.provider == "anthropic":
                     hinted = self._extract_anthropic_version_hint(error_text)
                     if hinted and hinted != self._anthropic_version:
                         self._anthropic_version = hinted
@@ -305,29 +329,32 @@ class VertexLLM(CloudLLM):
                 raise RuntimeError(f"Vertex AI error ({response.status}): {error_text}")
 
             data = await response.json()
-
-            if is_anthropic:
-                return self._parse_anthropic_response(data, request.model)
-            return self._parse_google_response(data, request.model)
+            return self._parse_response(data, request)
 
     async def close(self) -> None:
         if self._session:
             await self._session.close()
             self._session = None
 
-    def check_model_access(self, models: list[tuple[str, str]]) -> list[tuple[str, str]]:
-        """Anthropic models are gated by Vertex AI Model Garden; Google's own
-        models aren't, so only anthropic pairs are actually checked live.
+    def check_model_access(
+        self, models: list[tuple[str, str]]
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        """All non-Google models are gated by Vertex AI Model Garden.
 
-        Each pair is first resolved to the nearest available catalog version
-        (see generate()/_select_anthropic_model), since that's the model that
-        will actually be called -- so the reported and cached result matches
-        real runtime behavior, not the literal configured id.
+        A pair whose live check comes back inconclusive (e.g. rate-limited)
+        appears in neither returned list.
         """
-        pairs = [(provider, model) for provider, model in models if provider == "anthropic"]
-        if not pairs:
-            return []
-        return asyncio.run(self._check_anthropic_access(pairs))
+        gated: list[tuple[str, str]] = []
+        passthrough: list[tuple[str, str]] = []
+        for provider, model in models:
+            if provider == "google":
+                passthrough.append((provider, model))
+            else:
+                gated.append((provider, model))
+        if not gated:
+            return [], passthrough
+        missing, verified = asyncio.run(self._check_gated_access(gated))
+        return missing, verified + passthrough
 
     def catalog_display_name(self, provider: str, model: str) -> str:
         if provider != "anthropic":
@@ -338,24 +365,24 @@ class VertexLLM(CloudLLM):
         return f"https://console.cloud.google.com/agent-platform/model-garden?project={self.project_id}"
 
     def _resolve_model(self, request: CloudLLMRequest) -> CloudLLMRequest:
-        """Map non-native providers to a Gemini tier placeholder.
+        """Route provider to the correct Vertex AI path.
 
-        Anthropic and Google are natively supported on Vertex and are left as-is.
-        Other providers (OpenAI/OpenRouter/etc.) are mapped by capability tier.
+        Only providers that have NO Vertex publisher (openai, openrouter)
+        are mapped to a Gemini tier.  Everything else — Anthropic, Google,
+        Mistral, Meta, Moonshot, Qwen, whatever — passes through as-is.
         """
-        if request.provider in ("google", "anthropic"):
-            return request
-
-        tier = _classify_openai_tier(request.model)
-        return CloudLLMRequest(
-            prompt=request.prompt,
-            model=f"__auto_tier__:{tier}",
-            provider="google",
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            response_schema=request.response_schema,
-        )
+        if request.provider in _NON_VERTEX_PROVIDERS:
+            tier = _classify_openai_tier(request.model)
+            return CloudLLMRequest(
+                prompt=request.prompt,
+                model=f"__auto_tier__:{tier}",
+                provider="google",
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                response_schema=request.response_schema,
+            )
+        return request
 
     async def _load_publisher_models(self, publisher: str) -> list[str]:
         """List available `publisher` models from Vertex AI's live catalog."""
@@ -364,7 +391,7 @@ class VertexLLM(CloudLLM):
 
         region = _region_for_provider(publisher, self.configured_region)
         url = (
-            f"https://{region}-aiplatform.googleapis.com/v1/"
+            f"https://{_vertex_endpoint_host(region)}/v1/"
             f"projects/{self.project_id}/locations/{region}/publishers/{publisher}/models"
         )
         token = _get_access_token()
@@ -437,6 +464,22 @@ class VertexLLM(CloudLLM):
         available = await self._load_publisher_models("anthropic")
         return anthropic_mapper.select_model(requested_model, available)
 
+    def _build_request(self, request: CloudLLMRequest) -> tuple[str, Dict[str, Any]]:
+        """Dispatch to the correct request builder based on provider."""
+        if request.provider == "anthropic":
+            return self._build_anthropic_request(request, self._anthropic_version)
+        if request.provider == "google":
+            return self._build_google_request(request)
+        return self._build_partner_request(request)
+
+    def _parse_response(self, data: dict, request: CloudLLMRequest) -> CloudLLMResponse:
+        """Dispatch to the correct response parser based on provider."""
+        if request.provider == "anthropic":
+            return self._parse_anthropic_response(data, request.model)
+        if request.provider == "google":
+            return self._parse_google_response(data, request.model)
+        return self._parse_partner_response(data, request.model)
+
     def _build_anthropic_request(
         self,
         request: CloudLLMRequest,
@@ -444,10 +487,11 @@ class VertexLLM(CloudLLM):
     ) -> tuple[str, Dict[str, Any]]:
         """Build rawPredict request for Anthropic models on Vertex."""
         region = _region_for_provider("anthropic", self.configured_region)
+        vertex_model_id = anthropic_mapper.to_vertex_id(request.model)
         url = (
-            f"https://{region}-aiplatform.googleapis.com/v1/"
+            f"https://{_vertex_endpoint_host(region)}/v1/"
             f"projects/{self.project_id}/locations/{region}/"
-            f"publishers/anthropic/models/{request.model}:rawPredict"
+            f"publishers/anthropic/models/{vertex_model_id}:rawPredict"
         )
 
         payload: Dict[str, Any] = {
@@ -468,11 +512,35 @@ class VertexLLM(CloudLLM):
 
         return url, payload
 
+    def _build_partner_request(
+        self, request: CloudLLMRequest,
+    ) -> tuple[str, Dict[str, Any]]:
+        """Build rawPredict request for any Vertex partner (OpenAI-compatible)."""
+        publisher = _resolve_publisher(request.provider)
+        region = _region_for_provider(request.provider, self.configured_region)
+        url = (
+            f"https://{_vertex_endpoint_host(region)}/v1/"
+            f"projects/{self.project_id}/locations/{region}/"
+            f"publishers/{publisher}/models/{request.model}:rawPredict"
+        )
+
+        payload: Dict[str, Any] = {
+            "model": request.model,
+            "messages": [{"role": "user", "content": request.prompt}],
+            "max_tokens": request.max_tokens,
+        }
+        if request.temperature is not None:
+            payload["temperature"] = request.temperature
+        if request.top_p is not None:
+            payload["top_p"] = request.top_p
+
+        return url, payload
+
     def _build_google_request(self, request: CloudLLMRequest) -> tuple[str, Dict[str, Any]]:
         """Build generateContent request for Google models (Gemini) on Vertex."""
         region = _region_for_provider("google", self.configured_region)
         url = (
-            f"https://{region}-aiplatform.googleapis.com/v1/"
+            f"https://{_vertex_endpoint_host(region)}/v1/"
             f"projects/{self.project_id}/locations/{region}/"
             f"publishers/google/models/{request.model}:generateContent"
         )
@@ -504,6 +572,22 @@ class VertexLLM(CloudLLM):
                     data.get("usage", {}).get("input_tokens", 0)
                     + data.get("usage", {}).get("output_tokens", 0)
                 ),
+            },
+            raw=data,
+        )
+
+    def _parse_partner_response(self, data: dict, model: str) -> CloudLLMResponse:
+        """Parse OpenAI-compatible chat completions response from partner models."""
+        choices = data.get("choices", [])
+        text = choices[0]["message"]["content"] if choices else ""
+        usage_raw = data.get("usage", {})
+        return CloudLLMResponse(
+            text=text,
+            model=model,
+            usage={
+                "input_tokens": usage_raw.get("prompt_tokens", 0),
+                "output_tokens": usage_raw.get("completion_tokens", 0),
+                "total_tokens": usage_raw.get("total_tokens", 0),
             },
             raw=data,
         )
@@ -566,32 +650,38 @@ class VertexLLM(CloudLLM):
                 f"Vertex AI API not enabled. Enabling automatically..."
             )
 
-    async def _check_anthropic_access(
+    async def _check_gated_access(
         self, pairs: list[tuple[str, str]]
-    ) -> list[tuple[str, str]]:
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        """Check Model Garden access for Anthropic and MaaS partner models."""
         try:
             resolved_pairs = []
-            for _, model in pairs:
-                resolved_model = await self._select_anthropic_model(model)
-                if resolved_model != model:
-                    logger.warning(
-                        f"Cloud model mapping: anthropic/{model} -> "
-                        f"anthropic/{resolved_model} (exact version unavailable)"
-                    )
-                resolved_pairs.append(("anthropic", resolved_model))
+            for provider, model in pairs:
+                if provider == "anthropic":
+                    resolved_model = await self._select_anthropic_model(model)
+                    if resolved_model != model:
+                        logger.warning(
+                            f"Cloud model mapping: anthropic/{model} -> "
+                            f"anthropic/{resolved_model} (exact version unavailable)"
+                        )
+                    resolved_pairs.append(("anthropic", resolved_model))
+                else:
+                    resolved_pairs.append((provider, model))
             results = await asyncio.gather(
                 *(self._probe_model_access(provider, model) for provider, model in resolved_pairs)
             )
         finally:
             await self.close()
-        return [pair for pair, accessible in zip(resolved_pairs, results) if not accessible]
+        missing = [pair for pair, accessible in zip(resolved_pairs, results) if accessible is False]
+        verified = [pair for pair, accessible in zip(resolved_pairs, results) if accessible is True]
+        return missing, verified
 
-    async def _probe_model_access(self, provider: str, model: str) -> bool:
+    async def _probe_model_access(self, provider: str, model: str) -> Optional[bool]:
         """Return whether this project can call `model`, without logging or opening a browser.
 
-        Vertex has no endpoint that reports project-scoped Model Garden access
-        separately from actually invoking the model, so this sends one
-        minimal live request and reads the status.
+        Sends one minimal live request and reads the status. True/False only
+        for a status we have direct, confirmed evidence for (200 / the
+        specific 404 "not found or no access" shape); None for anything else.
         """
         request = CloudLLMRequest(
             prompt="hi",
@@ -602,11 +692,8 @@ class VertexLLM(CloudLLM):
             top_p=None,
             response_schema=None,
         )
-        url, payload = (
-            self._build_anthropic_request(request, self._anthropic_version)
-            if provider == "anthropic"
-            else self._build_google_request(request)
-        )
+        url, payload = self._build_request(request)
+
         token = _get_access_token()
         headers = {
             "Authorization": f"Bearer {token}",
@@ -616,8 +703,10 @@ class VertexLLM(CloudLLM):
             self._session = aiohttp.ClientSession()
 
         async with self._session.post(url, json=payload, headers=headers) as response:
+            if response.status == 200:
+                return True
             if response.status == 404:
                 error_text = await response.text()
                 if "was not found" in error_text:
                     return False
-            return True
+            return None

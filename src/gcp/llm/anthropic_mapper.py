@@ -3,6 +3,12 @@
 Anthropic has shipped two id schemes: pre-Claude-4 puts the version right
 after "claude-" with the family after that (claude-3-5-haiku-20241022);
 Claude 4 onward puts the family right after "claude-" (claude-haiku-4-5-...).
+
+Dated snapshots are written with a trailing "-YYYYMMDD" almost everywhere (most
+provider APIs, lamia config, this module's own ids above) except one place:
+Vertex AI's wire format uses "@YYYYMMDD" instead (e.g.
+claude-haiku-4-5@20251001). Parsing accepts both separators; to_vertex_id()
+converts to the "@" form for the actual outgoing request.
 """
 import re
 from typing import Optional
@@ -10,10 +16,12 @@ from typing import Optional
 # Claude 4 onward: version right after the family name. Minor is capped at
 # 2 digits so it can't swallow an 8-digit date suffix as if it were a minor
 # version (e.g. claude-sonnet-4-20250514 has no minor, just a date).
-_MODEL_ID_RE_CURRENT = re.compile(r"^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$")
+_MODEL_ID_RE_CURRENT = re.compile(r"^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:[@-]\d{8})?$")
 # Pre-Claude-4 (e.g. claude-3-5-haiku-20241022, claude-3-opus-20240229):
 # version comes right after "claude-", family after that.
-_MODEL_ID_RE_LEGACY = re.compile(r"^claude-(\d+)(?:-(\d+))?-([a-z]+)(?:-\d{8})?$")
+_MODEL_ID_RE_LEGACY = re.compile(r"^claude-(\d+)(?:-(\d+))?-([a-z]+)(?:[@-]\d{8})?$")
+
+_DATE_SUFFIX_RE = re.compile(r"-(\d{8})$")
 
 _FAMILIES = ("opus", "sonnet", "haiku", "fable")
 
@@ -88,6 +96,16 @@ def select_model(requested_model: str, available: list[str]) -> str:
 
     family_candidates.sort(key=_version_rank, reverse=True)
     return family_candidates[0]
+
+
+def to_vertex_id(model_id: str) -> str:
+    """Convert a dated snapshot id to Vertex AI's wire format ("@" before the
+    date instead of "-"). Ids with no date, or already using "@", or that
+    don't parse as a known Anthropic id shape at all, are returned unchanged.
+    """
+    if _parse_model_id(model_id) is None:
+        return model_id
+    return _DATE_SUFFIX_RE.sub(r"@\1", model_id)
 
 
 def _parse_model_id(model_id: str) -> Optional[tuple[str, int, int]]:
