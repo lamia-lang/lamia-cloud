@@ -360,6 +360,7 @@ src/gcp/
 ├── __init__.py             ← exports GCPCloudScheduler, GCPTriggerProvider, VertexLLM, etc.
 ├── connect.py              ← repository connection: WIF, per-repo SAs, Cloud Build GitHub App
 ├── deployer.py             ← Cloud Build + Cloud Run Job deployment
+├── storage_utils.py        ← GCS bucket helper (get-or-create)
 ├── scheduler.py            ← Cloud Scheduler integration
 ├── scheduler_job.py        ← Cloud Scheduler job construction (shared by scheduler + triggers)
 ├── trigger_provider.py     ← Trigger orchestration (Eventarc, Workflows, Pub/Sub)

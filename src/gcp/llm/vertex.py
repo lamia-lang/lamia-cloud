@@ -15,17 +15,19 @@ alias table normalises common shorthand names to Vertex publisher ids
 """
 import asyncio
 import difflib
+import json
 import logging
 import os
 import re
 import urllib.request
-from datetime import date
 from typing import Optional, Dict, Any
 
 import aiohttp
-from google.cloud import resourcemanager_v3
+from google.api_core.exceptions import PreconditionFailed
+from google.cloud import storage
 
 from lamia_cloud.gcp.llm import anthropic_mapper
+from lamia_cloud.gcp.storage_utils import ensure_bucket
 from lamia_cloud.interfaces import CloudLLM
 from lamia_cloud.types import CloudLLMRequest, CloudLLMResponse
 
@@ -103,51 +105,108 @@ def is_on_gcp() -> bool:
         return False
 
 
+_MODEL_MAP_KEY = "lamia-vertex-model-map"
+
+
+def _model_key(provider: str, model: str) -> str:
+    return f"{provider}:{model}"
+
+
+def _split_model_key(key: str) -> Optional[tuple[str, str]]:
+    provider, sep, model = key.partition(":")
+    return (provider, model) if sep and provider and model else None
+
+
 def get_verified_vertex_models(project_id: str) -> set[tuple[str, str]]:
     """(provider, model) pairs already confirmed accessible on Vertex AI for this project.
 
-    Stored as labels on the GCP project itself, so the cache is shared across
+    Stored as JSON in a GCS bucket, so the cache is shared across
     every team member and CI run against that project, not just one checkout.
     """
-    try:
-        client = resourcemanager_v3.ProjectsClient()
-        project = client.get_project(name=f"projects/{project_id}")
-        labels = project.labels or {}
-    except Exception:
-        return set()
     pairs = set()
-    for key in labels:
-        if not key.startswith(_VERTEX_MODEL_LABEL_PREFIX):
-            continue
-        provider, _, model = key[len(_VERTEX_MODEL_LABEL_PREFIX):].partition("-")
-        if provider and model:
-            pairs.add((provider, model))
+    for key in _read_verified_models(project_id):
+        pair = _split_model_key(key)
+        if pair:
+            pairs.add(pair)
     return pairs
 
 
 def remember_verified_vertex_models(project_id: str, models: set[tuple[str, str]]) -> None:
-    """Label the project with confirmed Vertex AI model access.
+    """Record confirmed Vertex AI model access."""
+    if not models:
+        return
+    updates = {_model_key(p, m): _model_key(p, m) for p, m in models}
+    _update_verified_models(project_id, updates)
 
-    Provider and model ids are already label-safe (lowercase letters, digits,
-    hyphens); any pair whose key doesn't fit the 63-char label key limit is
-    skipped rather than failing the whole call.
+
+def _read_verified_models(project_id: str) -> dict[str, str]:
+    try:
+        client = storage.Client(project=project_id)
+        bucket = client.bucket(_lamia_state_bucket_name(project_id))
+        blob = bucket.blob(_VERIFIED_MODELS_BLOB)
+        data = json.loads(blob.download_as_bytes())
+        return data.get(_MODEL_MAP_KEY, {})
+    except Exception:
+        return {}
+
+
+def _get_cached_resolution(project_id: str, provider: str, model: str) -> Optional[tuple[str, str]]:
+    """Look up the (provider, model) `(provider, model)` was previously
+    confirmed to resolve to, if any -- itself when verified as requested,
+    or a different model (same provider or a different one entirely, e.g.
+    a partner with no Vertex publisher mapped to a Gemini tier) when
+    resolution substituted one."""
+    resolved = _read_verified_models(project_id).get(_model_key(provider, model))
+    return _split_model_key(resolved) if resolved else None
+
+
+def _remember_resolved_models(project_id: str, mapping: dict[tuple[str, str], tuple[str, str]]) -> None:
+    """Persist the full requested -> resolved correlation for confirmed pairs.
+
+    Internal to this module -- CloudDeployer.remember_verified_model_access
+    only ever sees a flat set (see remember_verified_vertex_models), since
+    nothing outside this file needs to know what a pair resolved to.
+    """
+    if not mapping:
+        return
+    updates = {
+        _model_key(*requested): _model_key(*resolved)
+        for requested, resolved in mapping.items()
+    }
+    _update_verified_models(project_id, updates)
+
+
+def _update_verified_models(project_id: str, updates: dict[str, str]) -> None:
+    """Merge `updates` into the verified-models cache blob.
+
+    A real substitution (value != key) always overwrites; an identity entry
+    (value == key, from the flat CloudDeployer path) only fills in a key
+    that isn't already known, so it can never clobber a substitution
+    _remember_resolved_models already recorded for the same key.
     """
     try:
-        client = resourcemanager_v3.ProjectsClient()
-        project = client.get_project(name=f"projects/{project_id}")
-        if project.labels is None:
-            project.labels = {}
-        today = date.today().strftime("%Y%m%d")
-        changed = False
-        for provider, model in models:
-            key = _vertex_model_label_key(provider, model)
-            if len(key) > 63:
+        bucket = ensure_bucket(project_id, _lamia_state_bucket_name(project_id))
+        blob = bucket.blob(_VERIFIED_MODELS_BLOB)
+        for _attempt in range(2):
+            if blob.exists():
+                blob.reload()
+                generation = blob.generation
+                verified = json.loads(blob.download_as_bytes()).get(_MODEL_MAP_KEY, {})
+            else:
+                generation = 0
+                verified = {}
+            for key, value in updates.items():
+                if value != key or key not in verified:
+                    verified[key] = value
+            payload = json.dumps({_MODEL_MAP_KEY: verified}).encode()
+            try:
+                blob.upload_from_string(
+                    payload, content_type="application/json",
+                    if_generation_match=generation,
+                )
+                return
+            except PreconditionFailed:
                 continue
-            if project.labels.get(key) != today:
-                project.labels[key] = today
-                changed = True
-        if changed:
-            client.update_project(project=project)
     except Exception as exc:
         logger.warning(f"Failed to cache verified Vertex AI models on project {project_id}: {exc}")
 
@@ -249,11 +308,12 @@ def _vertex_endpoint_host(region: str) -> str:
     return f"{region}-aiplatform.googleapis.com"
 
 
-_VERTEX_MODEL_LABEL_PREFIX = "lamia-vertex-model-"
+_LAMIA_STATE_BUCKET_SUFFIX = "-lamia-state"
+_VERIFIED_MODELS_BLOB = "lamia-cache/verified-models.json"
 
 
-def _vertex_model_label_key(provider: str, model: str) -> str:
-    return f"{_VERTEX_MODEL_LABEL_PREFIX}{provider}-{model}"
+def _lamia_state_bucket_name(project_id: str) -> str:
+    return f"{project_id}{_LAMIA_STATE_BUCKET_SUFFIX}"
 
 
 class VertexLLM(CloudLLM):
@@ -285,6 +345,26 @@ class VertexLLM(CloudLLM):
         return is_on_gcp()
 
     async def generate(self, request: CloudLLMRequest) -> CloudLLMResponse:
+        cached = _get_cached_resolution(
+            self.project_id, request.provider, request.model,
+        )
+        if cached:
+            resolved_provider, resolved_model = cached
+            if resolved_provider != request.provider or resolved_model != request.model:
+                logger.info(
+                    f"Using cached mapping: {request.provider}/{request.model} -> "
+                    f"{resolved_provider}/{resolved_model}"
+                )
+                request = CloudLLMRequest(
+                    prompt=request.prompt,
+                    model=resolved_model,
+                    provider=resolved_provider,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    response_schema=request.response_schema,
+                )
+
         original_provider = request.provider
         original_model = request.model
         request = self._resolve_model(request)
@@ -692,11 +772,15 @@ class VertexLLM(CloudLLM):
     ]:
         """Pre-deploy model access check for ALL providers.
 
-        1. Resolve Anthropic model names against live catalog.
+        1. Resolve Anthropic model names against live catalog; resolve
+           providers with no Vertex publisher (openai) to a Gemini tier,
+           the same way generate() does for real calls.
         2. Probe every model in parallel.
         3. Auto-enable partner services for inaccessible models.
         4. Re-probe after enable.
-        5. For still-missing models, suggest closest available names.
+        5. For still-missing models, automatically try the closest
+           available names -- the first one that's accessible becomes the
+           resolved substitute.
 
         Returns (missing, verified, suggestions).
         """
@@ -711,6 +795,14 @@ class VertexLLM(CloudLLM):
                             f"anthropic/{resolved_model} (exact version unavailable)"
                         )
                     resolved_pairs.append(("anthropic", resolved_model))
+                elif provider in _NON_VERTEX_PROVIDERS:
+                    tier = _classify_openai_tier(model)
+                    mapped_model = await self._select_google_model_for_tier(tier)
+                    logger.warning(
+                        f"Cloud model mapping: {provider}/{model} -> google/{mapped_model} "
+                        f"({provider} has no Vertex publisher, tier: {tier})"
+                    )
+                    resolved_pairs.append(("google", mapped_model))
                 else:
                     resolved_pairs.append((provider, model))
 
@@ -732,34 +824,65 @@ class VertexLLM(CloudLLM):
 
             # Build results
             missing = [
-                pair for pair, acc in zip(resolved_pairs, results) if acc is False
+                pair for pair, acc in zip(pairs, results) if acc is False
             ]
             verified = [
-                pair for pair, acc in zip(resolved_pairs, results) if acc is True
+                pair for pair, acc in zip(pairs, results) if acc is True
             ]
+            resolved_mapping: dict[tuple[str, str], tuple[str, str]] = {
+                requested: resolved
+                for requested, resolved, acc in zip(pairs, resolved_pairs, results)
+                if acc is True
+            }
 
-            # Suggest closest names for missing models
+            # For still-missing models, try the closest available names --
+            # the first one that's accessible becomes the resolved substitute.
             suggestions: dict[tuple[str, str], list[str]] = {}
+            still_missing: list[tuple[str, str]] = []
             for provider, model in missing:
+                top: list[str] = []
                 try:
                     publisher = _resolve_publisher(provider)
                     available = await self._load_publisher_models(publisher)
-                    if not available:
-                        continue
-                    scored = [
-                        (m, _model_similarity(model, m))
-                        for m in available if m != model
-                    ]
-                    scored.sort(key=lambda x: x[1], reverse=True)
-                    top = [m for m, s in scored[:3] if s >= 0.25]
-                    if top:
-                        suggestions[(provider, model)] = top
+                    if available:
+                        scored = [
+                            (m, _model_similarity(model, m))
+                            for m in available if m != model
+                        ]
+                        scored.sort(key=lambda x: x[1], reverse=True)
+                        top = [m for m, s in scored[:3] if s >= 0.25]
                 except Exception:
                     pass
+                if top:
+                    suggestions[(provider, model)] = top
+
+                selected = None
+                for alt in top:
+                    probe = await self._probe_model_access(provider, alt)
+                    if probe is True:
+                        selected = alt
+                        break
+                    if probe is False:
+                        enabled = await self._auto_enable_partner_model(provider, alt)
+                        if enabled and await self._probe_model_access(provider, alt) is True:
+                            selected = alt
+                            break
+
+                if selected:
+                    verified.append((provider, model))
+                    resolved_mapping[(provider, model)] = (provider, selected)
+                    logger.warning(
+                        f"Cloud model mapping: {provider}/{model} -> {provider}/{selected} "
+                        f"(closest available match)"
+                    )
+                else:
+                    still_missing.append((provider, model))
+
+            _remember_resolved_models(self.project_id, resolved_mapping)
         finally:
             await self.close()
 
-        return missing, verified, suggestions
+        return still_missing, verified, suggestions
 
     async def _get_partner_service_name(self, provider: str, model: str) -> Optional[str]:
         """Extract the Cloud Partner Service name for a Model Garden model.

@@ -1,12 +1,19 @@
 """Tests for Cloud LLM (VertexLLM) and cloud detection."""
 
+import json
+
 import pytest
+from google.api_core.exceptions import PreconditionFailed
 from unittest.mock import patch, AsyncMock, MagicMock
 import aiohttp
 
 from lamia_cloud.gcp.llm.vertex import (
     VertexLLM,
     is_on_gcp,
+    get_verified_vertex_models,
+    remember_verified_vertex_models,
+    _get_cached_resolution,
+    _remember_resolved_models,
     _get_project_id,
     _region_for_provider,
     _resolve_publisher,
@@ -19,6 +26,18 @@ from lamia_cloud.gcp.llm.vertex import (
 )
 from lamia_cloud.types import CloudLLMRequest, CloudLLMResponse
 from lamia_cloud import get_cloud_llm, is_on_cloud
+
+
+@pytest.fixture(autouse=True)
+def no_real_gcs_by_default(monkeypatch):
+    """Tests unrelated to the verified-models cache still exercise code
+    paths (_get_cached_resolution, _remember_resolved_models) that call
+    storage.Client(). Fail fast by default instead of a real network call;
+    tests that actually cover the cache set up their own mock, which
+    overrides this since it runs later."""
+    def raise_immediately(project):
+        raise RuntimeError("no storage client in tests")
+    monkeypatch.setattr("lamia_cloud.gcp.llm.vertex.storage.Client", raise_immediately)
 
 
 class TestVertexLLMClassMethods:
@@ -49,7 +68,7 @@ class TestVertexLLMGenerate:
     def llm_request(self):
         return CloudLLMRequest(
             prompt="Hello",
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-4-5-20250514",
             provider="anthropic",
             max_tokens=1024,
         )
@@ -80,8 +99,70 @@ class TestVertexLLMGenerate:
         url = call_args[0][0]
         assert "test-project-id" in url
         assert "publishers/anthropic" in url
-        assert "claude-sonnet-4-6" in url
+        assert "claude-sonnet-4-5@20250514" in url
         assert ":rawPredict" in url
+
+    @pytest.mark.asyncio
+    @patch("lamia_cloud.gcp.llm.vertex._get_access_token", return_value="fake-token")
+    @patch("lamia_cloud.gcp.llm.vertex._get_cached_resolution")
+    async def test_generate_applies_cached_anthropic_resolution(self, mock_cache, mock_token, llm):
+        """User writes claude-sonnet-4-5 in config; pre-deploy resolved it to
+        the dated Model Garden version claude-sonnet-4-5-20250514. At runtime,
+        generate() must apply the cached mapping."""
+        mock_cache.return_value = ("anthropic", "claude-sonnet-4-5-20250514")
+        request = CloudLLMRequest(
+            prompt="Hello", model="claude-sonnet-4-5", provider="anthropic", max_tokens=1024,
+        )
+
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(return_value={
+            "content": [{"text": "hi"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+        mock_session = AsyncMock()
+        mock_session.post = MagicMock(return_value=mock_response)
+        llm._session = mock_session
+
+        await llm.generate(request)
+
+        mock_cache.assert_called_once_with("test-project-id", "anthropic", "claude-sonnet-4-5")
+        url = mock_session.post.call_args[0][0]
+        assert "claude-sonnet-4-5@20250514" in url
+        assert "claude-sonnet-4-5/" not in url
+
+    @pytest.mark.asyncio
+    @patch("lamia_cloud.gcp.llm.vertex._get_access_token", return_value="fake-token")
+    @patch("lamia_cloud.gcp.llm.vertex._get_cached_resolution")
+    async def test_generate_applies_cached_partner_resolution(self, mock_cache, mock_token, llm):
+        """User writes mistral-small-2503 in config; pre-deploy found it
+        inaccessible and auto-mapped to mistral-large-2411. At runtime,
+        generate() must apply the cached mapping for non-anthropic too."""
+        mock_cache.return_value = ("mistralai", "mistral-large-2411")
+        request = CloudLLMRequest(
+            prompt="Hello", model="mistral-small-2503", provider="mistralai", max_tokens=1024,
+        )
+
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(return_value={
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        })
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+        mock_session = AsyncMock()
+        mock_session.post = MagicMock(return_value=mock_response)
+        llm._session = mock_session
+
+        await llm.generate(request)
+
+        mock_cache.assert_called_once_with("test-project-id", "mistralai", "mistral-small-2503")
+        url = mock_session.post.call_args[0][0]
+        assert "mistral-large-2411" in url
+        assert "publishers/mistralai" in url
 
     @pytest.mark.asyncio
     @patch("lamia_cloud.gcp.llm.vertex._get_access_token", return_value="fake-token")
@@ -419,6 +500,46 @@ class TestCheckModelAccess:
         for pair_list in (missing, verified):
             assert ("anthropic", "claude-haiku-4-5-20251001") not in pair_list
 
+    def test_verified_keyed_by_requested_model_when_substituted(self, llm):
+        """User writes claude-sonnet-4-5 (no date); Vertex catalog has
+        claude-sonnet-4-5-20250514. `verified` must list the original lamia
+        name, not the dated Model Garden substitute."""
+        async def fake_select(model):
+            if model == "claude-sonnet-4-5":
+                return "claude-sonnet-4-5-20250514"
+            return model
+
+        async def fake_probe(provider, model):
+            return True
+
+        llm._select_anthropic_model = fake_select
+        llm._probe_model_access = fake_probe
+
+        missing, verified, _ = llm.check_model_access([("anthropic", "claude-sonnet-4-5")])
+
+        assert missing == []
+        assert verified == [("anthropic", "claude-sonnet-4-5")]
+
+    def test_verified_keyed_by_requested_model_when_substitute_is_a_different_family(self, llm):
+        """User writes claude-opus-4 but only claude-sonnet-4-5-20250514 is
+        in the catalog. The family-substring fallback selects it. `verified`
+        must still list the pair as the user requested it."""
+        async def fake_select(model):
+            if model == "claude-opus-4":
+                return "claude-sonnet-4-5-20250514"
+            return model
+
+        async def fake_probe(provider, model):
+            return True
+
+        llm._select_anthropic_model = fake_select
+        llm._probe_model_access = fake_probe
+
+        missing, verified, _ = llm.check_model_access([("anthropic", "claude-opus-4")])
+
+        assert missing == []
+        assert verified == [("anthropic", "claude-opus-4")]
+
     def test_google_is_probed_like_any_other_provider(self, llm):
         async def fake_probe(provider, model):
             return True
@@ -445,5 +566,205 @@ class TestCheckModelAccess:
         assert ("mistralai", "mistral-small-2503") in verified
         assert ("moonshotai", "kimi-k3") in verified
 
+    def test_missing_model_auto_mapped_to_closest_available(self, llm):
+        """mistral-small-2503 is not accessible on Vertex, but
+        mistral-large-2411 is. check_model_access must auto-select it,
+        move the pair from missing to verified, and record the suggestion."""
+        probed = {}
+
+        async def fake_probe(provider, model):
+            return probed.get(model)
+
+        async def fake_load(publisher):
+            return ["mistral-small-2501", "mistral-large-2411"]
+
+        probed["mistral-small-2503"] = False
+        probed["mistral-small-2501"] = False
+        probed["mistral-large-2411"] = True
+
+        llm._probe_model_access = fake_probe
+        llm._load_publisher_models = fake_load
+        llm._auto_enable_partner_model = AsyncMock(return_value=False)
+
+        missing, verified, suggestions = llm.check_model_access([
+            ("mistralai", "mistral-small-2503"),
+        ])
+
+        assert missing == []
+        assert ("mistralai", "mistral-small-2503") in verified
+        assert ("mistralai", "mistral-small-2503") in suggestions
+
+    def test_openai_model_resolved_to_gemini_tier(self, llm):
+        """openai:gpt-4 has no Vertex publisher -- check_model_access must
+        map it to a Google Gemini model (medium tier) and verify that."""
+        async def fake_probe(provider, model):
+            if provider == "google":
+                return True
+            return False
+
+        async def fake_ranked(tier):
+            return ["gemini-2.5-flash"]
+
+        llm._probe_model_access = fake_probe
+        llm._ranked_google_candidates = fake_ranked
+
+        missing, verified, _ = llm.check_model_access([("openai", "gpt-4")])
+
+        assert missing == []
+        assert ("openai", "gpt-4") in verified
+
     def test_empty_input_returns_empty_lists(self, llm):
         assert llm.check_model_access([]) == ([], [], {})
+
+
+class TestVerifiedModelsCache:
+    @staticmethod
+    def _mock_storage(monkeypatch, existing: dict[str, str] | None, generation: int = 1):
+        blob = MagicMock()
+        blob.exists.return_value = existing is not None
+        blob.generation = generation
+        if existing is not None:
+            blob.download_as_bytes.return_value = json.dumps(
+                {"lamia-vertex-model-map": existing}
+            ).encode()
+
+        bucket = MagicMock()
+        bucket.exists.return_value = True
+        bucket.blob.return_value = blob
+
+        client = MagicMock()
+        client.bucket.return_value = bucket
+        client.create_bucket.return_value = bucket
+
+        monkeypatch.setattr(
+            "lamia_cloud.gcp.llm.vertex.storage.Client", lambda project: client
+        )
+        return client, bucket, blob
+
+    def test_get_verified_models_returns_pairs(self, monkeypatch):
+        self._mock_storage(monkeypatch, {
+            "anthropic:claude-sonnet-4-5-20250514": "anthropic:claude-sonnet-4-5-20250514",
+        })
+
+        result = get_verified_vertex_models("my-project")
+
+        assert result == {("anthropic", "claude-sonnet-4-5-20250514")}
+
+    def test_get_verified_models_parses_raw_blob_bytes(self, monkeypatch):
+        """Same as above but bypassing _mock_storage's dict->json.dumps step,
+        so the exact bytes read off the blob are spelled out literally."""
+        raw = (
+            b'{"lamia-vertex-model-map": {"anthropic:claude-sonnet-4-5-20250514": "anthropic:claude-sonnet-4-5-20250514", '
+            b'"google:gemini-2.5-flash": "google:gemini-2.5-flash"}}'
+        )
+        blob = MagicMock()
+        blob.download_as_bytes.return_value = raw
+        bucket = MagicMock()
+        bucket.blob.return_value = blob
+        client = MagicMock()
+        client.bucket.return_value = bucket
+        monkeypatch.setattr(
+            "lamia_cloud.gcp.llm.vertex.storage.Client", lambda project: client
+        )
+
+        result = get_verified_vertex_models("my-project")
+
+        assert result == {
+            ("anthropic", "claude-sonnet-4-5-20250514"),
+            ("google", "gemini-2.5-flash"),
+        }
+
+    def test_uses_dedicated_lamia_state_bucket(self, monkeypatch):
+        client, _, _ = self._mock_storage(monkeypatch, {})
+
+        get_verified_vertex_models("my-project")
+
+        client.bucket.assert_called_once_with("my-project-lamia-state")
+
+    def test_get_verified_models_missing_blob_returns_empty(self, monkeypatch):
+        self._mock_storage(monkeypatch, existing=None)
+
+        assert get_verified_vertex_models("my-project") == set()
+
+    def test_get_verified_models_client_error_returns_empty(self, monkeypatch):
+        def raise_error(project):
+            raise RuntimeError("no credentials")
+
+        monkeypatch.setattr("lamia_cloud.gcp.llm.vertex.storage.Client", raise_error)
+
+        assert get_verified_vertex_models("my-project") == set()
+
+    def test_remember_verified_models_merges_with_existing(self, monkeypatch):
+        _, _, blob = self._mock_storage(
+            monkeypatch, {"anthropic:claude-opus-4-20250514": "anthropic:claude-opus-4-20250514"}
+        )
+
+        remember_verified_vertex_models("my-project", {("anthropic", "claude-sonnet-4-5-20250514")})
+
+        payload = json.loads(blob.upload_from_string.call_args[0][0])
+        assert payload["lamia-vertex-model-map"] == {
+            "anthropic:claude-opus-4-20250514": "anthropic:claude-opus-4-20250514",
+            "anthropic:claude-sonnet-4-5-20250514": "anthropic:claude-sonnet-4-5-20250514",
+        }
+
+    def test_remember_verified_models_creates_bucket_if_missing(self, monkeypatch):
+        client, bucket, _ = self._mock_storage(monkeypatch, existing=None)
+        bucket.exists.return_value = False
+
+        remember_verified_vertex_models("my-project", {("anthropic", "claude-sonnet-4-5-20250514")})
+
+        client.create_bucket.assert_called_once()
+
+    def test_remember_verified_models_retries_once_on_conflict(self, monkeypatch):
+        _, _, blob = self._mock_storage(monkeypatch, {})
+        blob.upload_from_string.side_effect = [PreconditionFailed("conflict"), None]
+
+        remember_verified_vertex_models("my-project", {("anthropic", "claude-sonnet-4-5-20250514")})
+
+        assert blob.upload_from_string.call_count == 2
+
+    def test_remember_verified_models_empty_input_is_noop(self, monkeypatch):
+        client, _, _ = self._mock_storage(monkeypatch, {})
+
+        remember_verified_vertex_models("my-project", set())
+
+        client.bucket.assert_not_called()
+
+    def test_get_cached_resolution_returns_substitute(self, monkeypatch):
+        self._mock_storage(monkeypatch, {
+            "anthropic:claude-sonnet-4-5": "anthropic:claude-sonnet-4-5-20250514",
+        })
+
+        assert _get_cached_resolution("my-project", "anthropic", "claude-sonnet-4-5") == (
+            "anthropic", "claude-sonnet-4-5-20250514",
+        )
+
+    def test_get_cached_resolution_none_when_not_cached(self, monkeypatch):
+        self._mock_storage(monkeypatch, {})
+
+        assert _get_cached_resolution("my-project", "anthropic", "claude-sonnet-4") is None
+
+    def test_remember_resolved_models_records_substitution(self, monkeypatch):
+        _, _, blob = self._mock_storage(monkeypatch, {})
+
+        _remember_resolved_models("my-project", {
+            ("anthropic", "claude-sonnet-4-5"): ("anthropic", "claude-sonnet-4-5-20250514"),
+        })
+
+        payload = json.loads(blob.upload_from_string.call_args[0][0])
+        assert payload["lamia-vertex-model-map"] == {
+            "anthropic:claude-sonnet-4-5": "anthropic:claude-sonnet-4-5-20250514",
+        }
+
+    def test_substitution_is_not_clobbered_by_later_identity_write(self, monkeypatch):
+        """remember_verified_vertex_models (the flat CloudDeployer path) must
+        not overwrite a real substitution _remember_resolved_models already
+        recorded for the same key, even though both write to the same blob."""
+        _, _, blob = self._mock_storage(
+            monkeypatch, {"anthropic:claude-sonnet-4-5": "anthropic:claude-sonnet-4-5-20250514"}
+        )
+
+        remember_verified_vertex_models("my-project", {("anthropic", "claude-sonnet-4-5")})
+
+        payload = json.loads(blob.upload_from_string.call_args[0][0])
+        assert payload["lamia-vertex-model-map"]["anthropic:claude-sonnet-4-5"] == "anthropic:claude-sonnet-4-5-20250514"
