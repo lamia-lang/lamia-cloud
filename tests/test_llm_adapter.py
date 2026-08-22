@@ -460,6 +460,47 @@ class TestProbeModelAccess:
         body = '{"error": {"code": 429, "message": "Quota exceeded for ... base model: anthropic-claude-haiku-4-5", "status": "RESOURCE_EXHAUSTED"}}'
         assert await self._probe_with_status(llm, 429, body) is None
 
+    @pytest.mark.asyncio
+    async def test_429_for_partner_model_is_accessible(self, llm):
+        """Partner models (meta, mistral, etc.) treat 429 as proof of access —
+        unlike Anthropic, disabled partner models return 404 not 429."""
+        mock_response = AsyncMock()
+        mock_response.status = 429
+        mock_response.text = AsyncMock(return_value='{"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}')
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+        mock_session = AsyncMock()
+        mock_session.post = MagicMock(return_value=mock_response)
+        llm._session = mock_session
+        with patch("lamia_cloud.gcp.llm.vertex._get_access_token", return_value="fake-token"):
+            assert await llm._probe_model_access("meta", "llama-4-maverick-17b-128e-instruct-maas") is True
+
+    @pytest.mark.asyncio
+    async def test_multi_region_probe_finds_model_in_alternate_region(self, llm):
+        """When primary region returns 404, try alternate regions."""
+        call_count = 0
+        def make_response(status, body=""):
+            r = AsyncMock()
+            r.status = status
+            r.text = AsyncMock(return_value=body)
+            r.__aenter__ = AsyncMock(return_value=r)
+            r.__aexit__ = AsyncMock(return_value=False)
+            return r
+
+        responses = []
+        # Primary region → 404
+        responses.append(make_response(404, '{"error": {"message": "was not found"}}'))
+        # First alternate (us-east5 is first in PARTNER_PROBE_REGIONS) → 200
+        responses.append(make_response(200))
+
+        mock_session = AsyncMock()
+        mock_session.post = MagicMock(side_effect=responses)
+        llm._session = mock_session
+        with patch("lamia_cloud.gcp.llm.vertex._get_access_token", return_value="fake-token"):
+            result = await llm._probe_model_access("meta", "llama-4-maverick-17b-128e-instruct-maas")
+        assert result is True
+        assert llm._model_regions.get("meta:llama-4-maverick-17b-128e-instruct-maas") == "us-east5"
+
 
 class TestCheckModelAccess:
     """check_model_access must split a batch into exactly the pairs proven
@@ -634,7 +675,7 @@ class TestCheckModelAccess:
 
         assert ("meta", "llama-3.3-70b-instruct-maas") in missing
         assert ("meta", "llama-3.3-70b-instruct-maas") in needs_terms
-        assert "publishers/meta/models/llama-3.3-70b-instruct-maas" in needs_terms[("meta", "llama-3.3-70b-instruct-maas")]
+        assert "publishers/meta/model-garden/llama-3.3-70b-instruct-maas" in needs_terms[("meta", "llama-3.3-70b-instruct-maas")]
 
     def test_model_not_in_catalog_has_no_needs_terms_entry(self, llm):
         """A typo model that doesn't exist in the catalog at all should

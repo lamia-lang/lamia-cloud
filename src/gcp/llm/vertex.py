@@ -106,6 +106,15 @@ def is_on_gcp() -> bool:
 
 
 _MODEL_MAP_KEY = "lamia-vertex-model-map"
+_REGIONS_MAP_KEY = "lamia-vertex-model-regions"
+
+_PARTNER_PROBE_REGIONS = [
+    "us-east5",
+    "us-central1",
+    "global",
+    "europe-west1",
+    "asia-southeast1",
+]
 
 
 def _model_key(provider: str, model: str) -> str:
@@ -176,13 +185,16 @@ def _remember_resolved_models(project_id: str, mapping: dict[tuple[str, str], tu
     _update_verified_models(project_id, updates)
 
 
-def _update_verified_models(project_id: str, updates: dict[str, str]) -> None:
-    """Merge `updates` into the verified-models cache blob.
+def _update_cache_section(project_id: str, section_key: str, updates: dict[str, str],
+                          *, identity_safe: bool = True) -> None:
+    """Merge `updates` into one section of the verified-models cache blob.
 
-    A real substitution (value != key) always overwrites; an identity entry
-    (value == key, from the flat CloudDeployer path) only fills in a key
-    that isn't already known, so it can never clobber a substitution
-    _remember_resolved_models already recorded for the same key.
+    When *identity_safe* is True (the default, used for model maps), a real
+    substitution (value != key) always overwrites; an identity entry
+    (value == key) only fills in a key that isn't already known.
+
+    When *identity_safe* is False (used for region maps), every update is
+    written unconditionally.
     """
     try:
         bucket = ensure_bucket(project_id, _lamia_state_bucket_name(project_id))
@@ -191,14 +203,16 @@ def _update_verified_models(project_id: str, updates: dict[str, str]) -> None:
             if blob.exists():
                 blob.reload()
                 generation = blob.generation
-                verified = json.loads(blob.download_as_bytes()).get(_MODEL_MAP_KEY, {})
+                full_data = json.loads(blob.download_as_bytes())
             else:
                 generation = 0
-                verified = {}
+                full_data = {}
+            section = full_data.get(section_key, {})
             for key, value in updates.items():
-                if value != key or key not in verified:
-                    verified[key] = value
-            payload = json.dumps({_MODEL_MAP_KEY: verified}).encode()
+                if not identity_safe or value != key or key not in section:
+                    section[key] = value
+            full_data[section_key] = section
+            payload = json.dumps(full_data).encode()
             try:
                 blob.upload_from_string(
                     payload, content_type="application/json",
@@ -208,7 +222,30 @@ def _update_verified_models(project_id: str, updates: dict[str, str]) -> None:
             except PreconditionFailed:
                 continue
     except Exception as exc:
-        logger.warning(f"Failed to cache verified Vertex AI models on project {project_id}: {exc}")
+        logger.warning(f"Failed to update cache section {section_key} on project {project_id}: {exc}")
+
+
+def _update_verified_models(project_id: str, updates: dict[str, str]) -> None:
+    _update_cache_section(project_id, _MODEL_MAP_KEY, updates, identity_safe=True)
+
+
+def _get_cached_model_regions(project_id: str) -> dict[str, str]:
+    """Read the model→region cache: ``{"meta:llama-4-...": "us-east5", ...}``."""
+    try:
+        client = storage.Client(project=project_id)
+        bucket = client.bucket(_lamia_state_bucket_name(project_id))
+        blob = bucket.blob(_VERIFIED_MODELS_BLOB)
+        data = json.loads(blob.download_as_bytes())
+        return data.get(_REGIONS_MAP_KEY, {})
+    except Exception:
+        return {}
+
+
+def _remember_model_regions(project_id: str, regions: dict[str, str]) -> None:
+    """Persist discovered model→region mappings."""
+    if not regions:
+        return
+    _update_cache_section(project_id, _REGIONS_MAP_KEY, regions, identity_safe=False)
 
 
 def _resolve_publisher(provider: str) -> str:
@@ -332,6 +369,7 @@ class VertexLLM(CloudLLM):
         self._session: Optional[aiohttp.ClientSession] = None
         self._publisher_models_cache: dict[str, list[str]] = {}
         self._anthropic_version = ANTHROPIC_VERTEX_VERSION
+        self._model_regions: dict[str, str] = {}
 
     @classmethod
     def from_config(cls, cloud_cfg: dict) -> "VertexLLM":
@@ -345,6 +383,9 @@ class VertexLLM(CloudLLM):
         return is_on_gcp()
 
     async def generate(self, request: CloudLLMRequest) -> CloudLLMResponse:
+        if not self._model_regions:
+            self._model_regions = _get_cached_model_regions(self.project_id)
+
         cached = _get_cached_resolution(
             self.project_id, request.provider, request.model,
         )
@@ -463,7 +504,7 @@ class VertexLLM(CloudLLM):
         publisher = _resolve_publisher(provider)
         return (
             f"https://console.cloud.google.com/vertex-ai/publishers/"
-            f"{publisher}/models/{model}?project={self.project_id}"
+            f"{publisher}/model-garden/{model}?project={self.project_id}"
         )
 
     def _resolve_model(self, request: CloudLLMRequest) -> CloudLLMRequest:
@@ -556,9 +597,9 @@ class VertexLLM(CloudLLM):
             if not candidates:
                 candidates = [m for m in available if _is_text_model(m) and "pro" in m]
         elif tier == "light":
-            candidates = [m for m in available if _is_text_model(m) and ("flash-lite" in m or "lite" in m)]
+            candidates = [m for m in available if _is_text_model(m) and ("flash-lite" in m or "lite" in m) and "preview" not in m]
         else:
-            candidates = [m for m in available if _is_text_model(m) and "flash" in m and "lite" not in m]
+            candidates = [m for m in available if _is_text_model(m) and "flash" in m and "lite" not in m and "preview" not in m]
 
         candidates.sort(key=_extract_version_score, reverse=True)
         return candidates
@@ -639,7 +680,11 @@ class VertexLLM(CloudLLM):
     ) -> tuple[str, Dict[str, Any]]:
         """Build rawPredict request for any Vertex partner (OpenAI-compatible)."""
         publisher = _resolve_publisher(request.provider)
-        region = _region_for_provider(request.provider, self.configured_region)
+        model_key = _model_key(request.provider, request.model)
+        region = self._model_regions.get(
+            model_key,
+            _region_for_provider(request.provider, self.configured_region),
+        )
         url = (
             f"https://{_vertex_endpoint_host(region)}/v1/"
             f"projects/{self.project_id}/locations/{region}/"
@@ -814,10 +859,6 @@ class VertexLLM(CloudLLM):
                 elif provider in _NON_VERTEX_PROVIDERS:
                     tier = _classify_openai_tier(model)
                     mapped_model = await self._select_google_model_for_tier(tier)
-                    logger.warning(
-                        f"Cloud model mapping: {provider}/{model} -> google/{mapped_model} "
-                        f"({provider} has no Vertex publisher, tier: {tier})"
-                    )
                     resolved_pairs.append(("google", mapped_model))
                 else:
                     resolved_pairs.append((provider, model))
@@ -853,11 +894,26 @@ class VertexLLM(CloudLLM):
                     if probe is True:
                         results[idx] = True
                         resolved_pairs[idx] = ("google", candidate)
-                        logger.warning(
-                            f"Cloud model mapping: {orig_provider}/{orig_model} -> "
-                            f"google/{candidate} (tier: {tier})"
-                        )
                         break
+
+            # Log final mapping for _NON_VERTEX_PROVIDERS (once, after retries)
+            for (orig_provider, orig_model), (res_p, res_m), accessible in zip(
+                pairs, resolved_pairs, results
+            ):
+                if orig_provider not in _NON_VERTEX_PROVIDERS:
+                    continue
+                tier = _classify_openai_tier(orig_model)
+                if accessible is True:
+                    logger.warning(
+                        f"Cloud model mapping: {orig_provider}/{orig_model} -> "
+                        f"google/{res_m} ({orig_provider} has no Vertex publisher, "
+                        f"tier: {tier})"
+                    )
+                else:
+                    logger.error(
+                        f"Cloud model mapping failed: {orig_provider}/{orig_model} "
+                        f"-> no accessible Gemini model found (tier: {tier})"
+                    )
 
             # Build results
             missing = [
@@ -929,6 +985,8 @@ class VertexLLM(CloudLLM):
                     still_missing.append((provider, model))
 
             _remember_resolved_models(self.project_id, resolved_mapping)
+            if self._model_regions:
+                _remember_model_regions(self.project_id, self._model_regions)
         finally:
             await self.close()
 
@@ -1010,13 +1068,10 @@ class VertexLLM(CloudLLM):
             logger.warning(f"Could not auto-enable {service_name}: {exc}")
         return False
 
-    async def _probe_model_access(self, provider: str, model: str) -> Optional[bool]:
-        """Return whether this project can call `model`, without logging or opening a browser.
-
-        Sends one minimal live request and reads the status. True/False only
-        for a status we have direct, confirmed evidence for (200 / the
-        specific 404 "not found or no access" shape); None for anything else.
-        """
+    async def _probe_single_region(
+        self, provider: str, model: str, region: str,
+    ) -> Optional[bool]:
+        """Probe a model in a specific region. Returns True/False/None."""
         request = CloudLLMRequest(
             prompt="hi",
             model=model,
@@ -1026,7 +1081,13 @@ class VertexLLM(CloudLLM):
             top_p=None,
             response_schema=None,
         )
-        url, payload = self._build_request(request)
+
+        old_region = self.configured_region
+        self.configured_region = region
+        try:
+            url, payload = self._build_request(request)
+        finally:
+            self.configured_region = old_region
 
         token = _get_access_token()
         headers = {
@@ -1039,8 +1100,46 @@ class VertexLLM(CloudLLM):
         async with self._session.post(url, json=payload, headers=headers) as response:
             if response.status == 200:
                 return True
+            if response.status == 429:
+                if provider not in ("google", "anthropic"):
+                    return True
+                return None
             if response.status == 404:
                 body = await response.text()
                 if "was not found" in body or "no access" in body:
                     return False
             return None
+
+    async def _probe_model_access(self, provider: str, model: str) -> Optional[bool]:
+        """Return whether this project can call `model`.
+
+        For partner models (not google/anthropic), tries the configured
+        region first, then falls back to ``_PARTNER_PROBE_REGIONS`` since
+        some models are region-locked (e.g. Meta Llama → us-east5).
+        """
+        primary_region = _region_for_provider(provider, self.configured_region)
+        result = await self._probe_single_region(provider, model, primary_region)
+        if result is True:
+            return True
+        if result is None:
+            return None
+
+        if provider in ("google", "anthropic"):
+            return result
+
+        had_inconclusive = False
+        for region in _PARTNER_PROBE_REGIONS:
+            if region == primary_region:
+                continue
+            alt_result = await self._probe_single_region(provider, model, region)
+            if alt_result is True:
+                key = _model_key(provider, model)
+                self._model_regions[key] = region
+                logger.info(
+                    f"Model {provider}/{model} found in region {region}"
+                )
+                return True
+            if alt_result is None:
+                had_inconclusive = True
+
+        return None if had_inconclusive else False
