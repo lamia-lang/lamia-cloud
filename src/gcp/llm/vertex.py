@@ -437,14 +437,18 @@ class VertexLLM(CloudLLM):
         list[tuple[str, str]],
         list[tuple[str, str]],
         dict[tuple[str, str], list[str]],
+        dict[tuple[str, str], str],
     ]:
         """Check all models (every provider) for accessibility.
 
         Attempts auto-enable for partner services when possible.
-        Returns (missing, verified, suggestions).
+        Returns (missing, verified, suggestions, needs_terms).
+
+        ``needs_terms`` maps models that exist in the catalog but require
+        manual EULA / terms acceptance to their Model Garden page URL.
         """
         if not models:
-            return [], [], {}
+            return [], [], {}, {}
         return asyncio.run(self._check_all_models(models))
 
     def catalog_display_name(self, provider: str, model: str) -> str:
@@ -454,6 +458,13 @@ class VertexLLM(CloudLLM):
 
     def model_catalog_url(self) -> str:
         return f"https://console.cloud.google.com/agent-platform/model-garden?project={self.project_id}"
+
+    def model_page_url(self, provider: str, model: str) -> str:
+        publisher = _resolve_publisher(provider)
+        return (
+            f"https://console.cloud.google.com/vertex-ai/publishers/"
+            f"{publisher}/models/{model}?project={self.project_id}"
+        )
 
     def _resolve_model(self, request: CloudLLMRequest) -> CloudLLMRequest:
         """Route provider to the correct Vertex AI path.
@@ -769,6 +780,7 @@ class VertexLLM(CloudLLM):
         list[tuple[str, str]],
         list[tuple[str, str]],
         dict[tuple[str, str], list[str]],
+        dict[tuple[str, str], str],
     ]:
         """Pre-deploy model access check for ALL providers.
 
@@ -782,7 +794,11 @@ class VertexLLM(CloudLLM):
            available names -- the first one that's accessible becomes the
            resolved substitute.
 
-        Returns (missing, verified, suggestions).
+        Returns (missing, verified, suggestions, needs_terms).
+
+        ``needs_terms`` maps (provider, model) to the Model Garden page
+        URL for models that exist in the catalog but require manual EULA
+        or terms acceptance before they can be used.
         """
         try:
             resolved_pairs = []
@@ -822,6 +838,27 @@ class VertexLLM(CloudLLM):
                     if re_probe is True:
                         results[idx] = True
 
+            # _NON_VERTEX_PROVIDERS whose first Gemini candidate failed:
+            # try remaining candidates before giving up.
+            for idx, ((orig_provider, orig_model), (res_p, res_m), accessible) in enumerate(
+                zip(pairs, resolved_pairs, results)
+            ):
+                if orig_provider not in _NON_VERTEX_PROVIDERS or accessible is True:
+                    continue
+                tier = _classify_openai_tier(orig_model)
+                for candidate in await self._ranked_google_candidates(tier):
+                    if candidate == res_m:
+                        continue
+                    probe = await self._probe_model_access("google", candidate)
+                    if probe is True:
+                        results[idx] = True
+                        resolved_pairs[idx] = ("google", candidate)
+                        logger.warning(
+                            f"Cloud model mapping: {orig_provider}/{orig_model} -> "
+                            f"google/{candidate} (tier: {tier})"
+                        )
+                        break
+
             # Build results
             missing = [
                 pair for pair, acc in zip(pairs, results) if acc is False
@@ -837,13 +874,22 @@ class VertexLLM(CloudLLM):
 
             # For still-missing models, try the closest available names --
             # the first one that's accessible becomes the resolved substitute.
+            # Skip _NON_VERTEX_PROVIDERS: they always map to Gemini (above),
+            # not to their own publisher catalog.
             suggestions: dict[tuple[str, str], list[str]] = {}
+            needs_terms: dict[tuple[str, str], str] = {}
             still_missing: list[tuple[str, str]] = []
             for provider, model in missing:
+                if provider in _NON_VERTEX_PROVIDERS:
+                    still_missing.append((provider, model))
+                    continue
+
                 top: list[str] = []
+                model_in_catalog = False
                 try:
                     publisher = _resolve_publisher(provider)
                     available = await self._load_publisher_models(publisher)
+                    model_in_catalog = model in available
                     if available:
                         scored = [
                             (m, _model_similarity(model, m))
@@ -876,13 +922,17 @@ class VertexLLM(CloudLLM):
                         f"(closest available match)"
                     )
                 else:
+                    if model_in_catalog:
+                        needs_terms[(provider, model)] = self.model_page_url(
+                            provider, model
+                        )
                     still_missing.append((provider, model))
 
             _remember_resolved_models(self.project_id, resolved_mapping)
         finally:
             await self.close()
 
-        return still_missing, verified, suggestions
+        return still_missing, verified, suggestions, needs_terms
 
     async def _get_partner_service_name(self, provider: str, model: str) -> Optional[str]:
         """Extract the Cloud Partner Service name for a Model Garden model.

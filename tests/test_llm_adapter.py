@@ -489,7 +489,7 @@ class TestCheckModelAccess:
         llm._select_anthropic_model = fake_select
         llm._probe_model_access = fake_probe
 
-        missing, verified, suggestions = llm.check_model_access([
+        missing, verified, suggestions, _ = llm.check_model_access([
             ("anthropic", "claude-sonnet-4-5-20250929"),
             ("anthropic", "claude-opus-4-5-20251101"),
             ("anthropic", "claude-haiku-4-5-20251001"),
@@ -515,7 +515,7 @@ class TestCheckModelAccess:
         llm._select_anthropic_model = fake_select
         llm._probe_model_access = fake_probe
 
-        missing, verified, _ = llm.check_model_access([("anthropic", "claude-sonnet-4-5")])
+        missing, verified, _, _ = llm.check_model_access([("anthropic", "claude-sonnet-4-5")])
 
         assert missing == []
         assert verified == [("anthropic", "claude-sonnet-4-5")]
@@ -535,7 +535,7 @@ class TestCheckModelAccess:
         llm._select_anthropic_model = fake_select
         llm._probe_model_access = fake_probe
 
-        missing, verified, _ = llm.check_model_access([("anthropic", "claude-opus-4")])
+        missing, verified, _, _ = llm.check_model_access([("anthropic", "claude-opus-4")])
 
         assert missing == []
         assert verified == [("anthropic", "claude-opus-4")]
@@ -546,7 +546,7 @@ class TestCheckModelAccess:
 
         llm._probe_model_access = fake_probe
 
-        missing, verified, _ = llm.check_model_access([("google", "gemini-2.5-flash")])
+        missing, verified, _, _ = llm.check_model_access([("google", "gemini-2.5-flash")])
         assert missing == []
         assert verified == [("google", "gemini-2.5-flash")]
 
@@ -556,7 +556,7 @@ class TestCheckModelAccess:
 
         llm._probe_model_access = fake_probe
 
-        missing, verified, _ = llm.check_model_access([
+        missing, verified, _, _ = llm.check_model_access([
             ("google", "gemini-2.5-flash"),
             ("mistralai", "mistral-small-2503"),
             ("moonshotai", "kimi-k3"),
@@ -586,7 +586,7 @@ class TestCheckModelAccess:
         llm._load_publisher_models = fake_load
         llm._auto_enable_partner_model = AsyncMock(return_value=False)
 
-        missing, verified, suggestions = llm.check_model_access([
+        missing, verified, suggestions, _ = llm.check_model_access([
             ("mistralai", "mistral-small-2503"),
         ])
 
@@ -608,13 +608,56 @@ class TestCheckModelAccess:
         llm._probe_model_access = fake_probe
         llm._ranked_google_candidates = fake_ranked
 
-        missing, verified, _ = llm.check_model_access([("openai", "gpt-4")])
+        missing, verified, _, _ = llm.check_model_access([("openai", "gpt-4")])
 
         assert missing == []
         assert ("openai", "gpt-4") in verified
 
+    def test_model_in_catalog_but_inaccessible_lands_in_needs_terms(self, llm):
+        """meta:llama-3.3-70b-instruct-maas exists in the Model Garden
+        catalog but the probe returns 404 (requires EULA acceptance).
+        It must appear in both missing and needs_terms with a direct
+        Model Garden page URL."""
+        async def fake_probe(provider, model):
+            return False
+
+        async def fake_load(publisher):
+            return ["llama-3.3-70b-instruct-maas", "llama-3.1-8b-instruct-maas"]
+
+        llm._probe_model_access = fake_probe
+        llm._load_publisher_models = fake_load
+        llm._auto_enable_partner_model = AsyncMock(return_value=False)
+
+        missing, verified, suggestions, needs_terms = llm.check_model_access([
+            ("meta", "llama-3.3-70b-instruct-maas"),
+        ])
+
+        assert ("meta", "llama-3.3-70b-instruct-maas") in missing
+        assert ("meta", "llama-3.3-70b-instruct-maas") in needs_terms
+        assert "publishers/meta/models/llama-3.3-70b-instruct-maas" in needs_terms[("meta", "llama-3.3-70b-instruct-maas")]
+
+    def test_model_not_in_catalog_has_no_needs_terms_entry(self, llm):
+        """A typo model that doesn't exist in the catalog at all should
+        NOT appear in needs_terms -- it's a wrong name, not a EULA issue."""
+        async def fake_probe(provider, model):
+            return False
+
+        async def fake_load(publisher):
+            return ["llama-3.3-70b-instruct-maas"]
+
+        llm._probe_model_access = fake_probe
+        llm._load_publisher_models = fake_load
+        llm._auto_enable_partner_model = AsyncMock(return_value=False)
+
+        missing, _, _, needs_terms = llm.check_model_access([
+            ("meta", "llama-4-nonexistent-model"),
+        ])
+
+        assert ("meta", "llama-4-nonexistent-model") in missing
+        assert ("meta", "llama-4-nonexistent-model") not in needs_terms
+
     def test_empty_input_returns_empty_lists(self, llm):
-        assert llm.check_model_access([]) == ([], [], {})
+        assert llm.check_model_access([]) == ([], [], {}, {})
 
 
 class TestVerifiedModelsCache:
