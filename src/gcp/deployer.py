@@ -871,6 +871,7 @@ def _ensure_service_account(project_id: str) -> str:
 
     Grants:
     - roles/aiplatform.user — Vertex AI model access
+    - roles/storage.objectViewer — read cached model maps / regions from GCS
     - roles/run.developer — allows Cloud Scheduler to run jobs
     """
     sa_email = f"lamia-runner@{project_id}.iam.gserviceaccount.com"
@@ -903,6 +904,7 @@ def _ensure_service_account(project_id: str) -> str:
 
     required_bindings = {
         "roles/aiplatform.user": [member],
+        "roles/storage.objectViewer": [member],
         "roles/iam.serviceAccountTokenCreator": [f"serviceAccount:{scheduler_sa}"],
         "roles/run.developer": [f"serviceAccount:{scheduler_sa}"],
     }

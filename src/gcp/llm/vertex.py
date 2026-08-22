@@ -151,13 +151,17 @@ def remember_verified_vertex_models(project_id: str, models: set[tuple[str, str]
 
 
 def _read_verified_models(project_id: str) -> dict[str, str]:
+    bucket_name = _lamia_state_bucket_name(project_id)
     try:
         client = storage.Client(project=project_id)
-        bucket = client.bucket(_lamia_state_bucket_name(project_id))
+        bucket = client.bucket(bucket_name)
         blob = bucket.blob(_VERIFIED_MODELS_BLOB)
         data = json.loads(blob.download_as_bytes())
         return data.get(_MODEL_MAP_KEY, {})
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            f"Could not read model cache from gs://{bucket_name}/{_VERIFIED_MODELS_BLOB}: {exc}"
+        )
         return {}
 
 
@@ -233,13 +237,17 @@ def _update_verified_models(project_id: str, updates: dict[str, str]) -> None:
 
 def _get_cached_model_regions(project_id: str) -> dict[str, str]:
     """Read the model→region cache: ``{"meta:llama-4-...": "us-east5", ...}``."""
+    bucket_name = _lamia_state_bucket_name(project_id)
     try:
         client = storage.Client(project=project_id)
-        bucket = client.bucket(_lamia_state_bucket_name(project_id))
+        bucket = client.bucket(bucket_name)
         blob = bucket.blob(_VERIFIED_MODELS_BLOB)
         data = json.loads(blob.download_as_bytes())
         return data.get(_REGIONS_MAP_KEY, {})
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            f"Could not read region cache from gs://{bucket_name}/{_VERIFIED_MODELS_BLOB}: {exc}"
+        )
         return {}
 
 
@@ -462,6 +470,30 @@ class VertexLLM(CloudLLM):
                             raise RuntimeError(
                                 f"Vertex AI error ({retry_response.status}): {error_text}"
                             )
+
+                if response.status == 404:
+                    model_key = _model_key(request.provider, request.model)
+                    current_region = self._model_regions.get(
+                        model_key,
+                        _region_for_provider(request.provider, self.configured_region),
+                    )
+                    if current_region not in ("global", "us", "eu"):
+                        for fallback in ("global", "us"):
+                            self._model_regions[model_key] = fallback
+                            fb_url, fb_payload = self._build_request(request)
+                            async with self._session.post(
+                                fb_url, json=fb_payload, headers=headers
+                            ) as fb_resp:
+                                if fb_resp.status == 200:
+                                    logger.info(
+                                        f"Model {request.provider}/{request.model} "
+                                        f"not in {current_region}, found in {fallback}"
+                                    )
+                                    data = await fb_resp.json()
+                                    return self._parse_response(data, request)
+                                if fb_resp.status != 404:
+                                    break
+                        self._model_regions.pop(model_key, None)
 
                 self._handle_api_error(response.status, error_text, request)
                 raise RuntimeError(f"Vertex AI error ({response.status}): {error_text}")
@@ -806,20 +838,30 @@ class VertexLLM(CloudLLM):
 
     def _handle_api_error(self, status: int, error_text: str, request: CloudLLMRequest) -> None:
         """Log actionable guidance for common Vertex AI errors."""
-        if status == 404 and "was not found" in error_text:
+        if status == 404:
+            model_key = _model_key(request.provider, request.model)
+            region = self._model_regions.get(
+                model_key,
+                _region_for_provider(request.provider, self.configured_region),
+            )
             model_garden_url = self.model_catalog_url()
             search_hint = self.catalog_display_name(request.provider, request.model)
             logger.error(
-                f"Model not accessible. In Model Garden, search \"{search_hint}\" "
-                f"and click Enable:\n"
-                f"  {model_garden_url}\n"
-                f"Then retry."
+                f"Model {request.provider}/{request.model} not found in "
+                f"region {region}. Search \"{search_hint}\" in Model Garden:\n"
+                f"  {model_garden_url}"
             )
             try:
                 import webbrowser
                 webbrowser.open(model_garden_url)
             except Exception:
                 pass
+        elif status == 429:
+            logger.warning(
+                f"Quota exceeded for {request.provider}/{request.model}. "
+                f"Request a quota increase: "
+                f"https://cloud.google.com/vertex-ai/docs/generative-ai/quotas-genai"
+            )
         elif status == 403 and "SERVICE_DISABLED" in error_text:
             logger.error(
                 f"Vertex AI API not enabled. Enabling automatically..."
@@ -1111,9 +1153,7 @@ class VertexLLM(CloudLLM):
                     return True
                 return None
             if response.status == 404:
-                body = await response.text()
-                if "was not found" in body or "no access" in body:
-                    return False
+                return False
             return None
 
     async def _probe_model_access(self, provider: str, model: str) -> Optional[bool]:

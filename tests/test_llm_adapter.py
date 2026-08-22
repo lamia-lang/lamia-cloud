@@ -439,10 +439,8 @@ class TestProbeModelAccess:
         assert await self._probe_with_status(llm, 404, body) is False
 
     @pytest.mark.asyncio
-    async def test_404_without_recognized_phrase_is_inconclusive(self, llm):
-        # A different 404 error shape isn't the confirmed consent-denial
-        # signal -- must not be silently treated as accessible or inaccessible.
-        assert await self._probe_with_status(llm, 404, '{"error": {"message": "unrelated"}}') is None
+    async def test_404_any_body_is_inaccessible(self, llm):
+        assert await self._probe_with_status(llm, 404, '{"error": {"message": "unrelated"}}') is False
 
     @pytest.mark.asyncio
     async def test_403_is_inconclusive(self, llm):
