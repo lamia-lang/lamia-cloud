@@ -108,10 +108,12 @@ def is_on_gcp() -> bool:
 _MODEL_MAP_KEY = "lamia-vertex-model-map"
 _REGIONS_MAP_KEY = "lamia-vertex-model-regions"
 
-_PARTNER_PROBE_REGIONS = [
+_FALLBACK_PROBE_REGIONS = [
     "us-east5",
     "us-central1",
     "global",
+    "us",
+    "eu",
     "europe-west1",
     "asia-southeast1",
 ]
@@ -705,7 +707,11 @@ class VertexLLM(CloudLLM):
 
     def _build_google_request(self, request: CloudLLMRequest) -> tuple[str, Dict[str, Any]]:
         """Build generateContent request for Google models (Gemini) on Vertex."""
-        region = _region_for_provider("google", self.configured_region)
+        model_key = _model_key("google", request.model)
+        region = self._model_regions.get(
+            model_key,
+            _region_for_provider("google", self.configured_region),
+        )
         url = (
             f"https://{_vertex_endpoint_host(region)}/v1/"
             f"projects/{self.project_id}/locations/{region}/"
@@ -1113,9 +1119,12 @@ class VertexLLM(CloudLLM):
     async def _probe_model_access(self, provider: str, model: str) -> Optional[bool]:
         """Return whether this project can call `model`.
 
-        For partner models (not google/anthropic), tries the configured
-        region first, then falls back to ``_PARTNER_PROBE_REGIONS`` since
-        some models are region-locked (e.g. Meta Llama → us-east5).
+        Tries the configured region first, then falls back to
+        ``_FALLBACK_PROBE_REGIONS`` since many models are region-locked
+        (e.g. Meta Llama → us-east5, Gemini 3.x → global/us/eu).
+
+        Anthropic is the only provider that skips the fallback sweep
+        because it has its own region routing and 429 can't be trusted.
         """
         primary_region = _region_for_provider(provider, self.configured_region)
         result = await self._probe_single_region(provider, model, primary_region)
@@ -1124,11 +1133,11 @@ class VertexLLM(CloudLLM):
         if result is None:
             return None
 
-        if provider in ("google", "anthropic"):
+        if provider == "anthropic":
             return result
 
         had_inconclusive = False
-        for region in _PARTNER_PROBE_REGIONS:
+        for region in _FALLBACK_PROBE_REGIONS:
             if region == primary_region:
                 continue
             alt_result = await self._probe_single_region(provider, model, region)
