@@ -3,15 +3,17 @@
 Routes LLM calls through Vertex AI using ADC. On Cloud Run, authentication
 is automatic via the metadata server. Locally, uses `gcloud auth application-default login`.
 
-Three request formats, chosen automatically:
-- Google  → generateContent (Gemini-specific)
+Four request formats, chosen automatically:
+- Google    → generateContent (Gemini-specific)
 - Anthropic → rawPredict with anthropic_version header (Anthropic-specific)
-- Any other provider → rawPredict with OpenAI-compatible chat completions
+- MaaS      → OpenAI-compat chat/completions (models ending in ``-maas``)
+- Other     → rawPredict with OpenAI-compatible body
 
 No static allowlist: any provider that appears in config.yaml and isn't
-"google" or "anthropic" is sent via the generic rawPredict path.  A small
-alias table normalises common shorthand names to Vertex publisher ids
-(e.g. "mistral" → "mistralai").
+"google" or "anthropic" is sent via the generic rawPredict path unless the
+model name ends in ``-maas`` (Model-as-a-Service), in which case Vertex's
+OpenAI-compatible endpoint is used instead.  A small alias table normalises
+common shorthand names to Vertex publisher ids (e.g. "mistral" → "mistralai").
 """
 import asyncio
 import difflib
@@ -256,6 +258,15 @@ def _remember_model_regions(project_id: str, regions: dict[str, str]) -> None:
     if not regions:
         return
     _update_cache_section(project_id, _REGIONS_MAP_KEY, regions, identity_safe=False)
+
+
+def _is_maas_model(model: str) -> bool:
+    """True for Model-as-a-Service models that require the OpenAI-compat endpoint.
+
+    MaaS models on Vertex (name ending in ``-maas``) return bogus 429 on
+    rawPredict but work via ``endpoints/openapi/chat/completions``.
+    """
+    return model.endswith("-maas")
 
 
 def _resolve_publisher(provider: str) -> str:
@@ -712,21 +723,35 @@ class VertexLLM(CloudLLM):
     def _build_partner_request(
         self, request: CloudLLMRequest,
     ) -> tuple[str, Dict[str, Any]]:
-        """Build rawPredict request for any Vertex partner (OpenAI-compatible)."""
+        """Build request for any Vertex partner model.
+
+        MaaS models (``-maas`` suffix) use the OpenAI-compat chat/completions
+        endpoint; all others use rawPredict.
+        """
         publisher = _resolve_publisher(request.provider)
         model_key = _model_key(request.provider, request.model)
         region = self._model_regions.get(
             model_key,
             _region_for_provider(request.provider, self.configured_region),
         )
-        url = (
-            f"https://{_vertex_endpoint_host(region)}/v1/"
-            f"projects/{self.project_id}/locations/{region}/"
-            f"publishers/{publisher}/models/{request.model}:rawPredict"
-        )
+
+        if _is_maas_model(request.model):
+            url = (
+                f"https://{_vertex_endpoint_host(region)}/v1beta1/"
+                f"projects/{self.project_id}/locations/{region}/"
+                f"endpoints/openapi/chat/completions"
+            )
+            model_id = f"{publisher}/{request.model}"
+        else:
+            url = (
+                f"https://{_vertex_endpoint_host(region)}/v1/"
+                f"projects/{self.project_id}/locations/{region}/"
+                f"publishers/{publisher}/models/{request.model}:rawPredict"
+            )
+            model_id = request.model
 
         payload: Dict[str, Any] = {
-            "model": request.model,
+            "model": model_id,
             "messages": [{"role": "user", "content": request.prompt}],
             "max_tokens": request.max_tokens,
         }
@@ -857,11 +882,18 @@ class VertexLLM(CloudLLM):
             except Exception:
                 pass
         elif status == 429:
-            logger.warning(
-                f"Quota exceeded for {request.provider}/{request.model}. "
-                f"Request a quota increase: "
-                f"https://cloud.google.com/vertex-ai/docs/generative-ai/quotas-genai"
-            )
+            quota_url = "https://cloud.google.com/vertex-ai/docs/generative-ai/quotas-genai"
+            if request.provider == "anthropic":
+                logger.warning(
+                    f"Quota exceeded for {request.provider}/{request.model}. "
+                    f"Anthropic models on Vertex AI have a default quota of 0. "
+                    f"Request a quota increase:\n  {quota_url}"
+                )
+            else:
+                logger.warning(
+                    f"Quota exceeded for {request.provider}/{request.model}. "
+                    f"Request a quota increase:\n  {quota_url}"
+                )
         elif status == 403 and "SERVICE_DISABLED" in error_text:
             logger.error(
                 f"Vertex AI API not enabled. Enabling automatically..."
@@ -915,11 +947,13 @@ class VertexLLM(CloudLLM):
                 *(self._probe_model_access(p, m) for p, m in resolved_pairs)
             ))
 
-            # Auto-enable partner services for inaccessible models
+            # Auto-enable partner services for inaccessible or inconclusive
+            # models.  Inconclusive (None) can mean 429 from a disabled
+            # partner service (e.g. Anthropic with default quota = 0).
             for idx, ((provider, model), accessible) in enumerate(
                 zip(resolved_pairs, results)
             ):
-                if accessible is not False:
+                if accessible is True:
                     continue
                 enabled = await self._auto_enable_partner_model(provider, model)
                 if enabled:
@@ -1119,7 +1153,11 @@ class VertexLLM(CloudLLM):
     async def _probe_single_region(
         self, provider: str, model: str, region: str,
     ) -> Optional[bool]:
-        """Probe a model in a specific region. Returns True/False/None."""
+        """Probe a model in a specific region.
+
+        Returns True (accessible), False (not found / 404), or None
+        (inconclusive — 429 quota or transient error).
+        """
         request = CloudLLMRequest(
             prompt="hi",
             model=model,
@@ -1149,11 +1187,17 @@ class VertexLLM(CloudLLM):
             if response.status == 200:
                 return True
             if response.status == 429:
-                if provider not in ("google", "anthropic"):
-                    return True
+                # 429 means the model exists but quota is exhausted/zero.
+                # Treat as inconclusive so we don't falsely claim it works
+                # (quota might be 0) or falsely claim it doesn't exist.
                 return None
             if response.status == 404:
                 return False
+            if response.status == 400:
+                error_text = await response.text()
+                if "not available in re" in error_text.lower():
+                    return False
+                return None
             return None
 
     async def _probe_model_access(self, provider: str, model: str) -> Optional[bool]:

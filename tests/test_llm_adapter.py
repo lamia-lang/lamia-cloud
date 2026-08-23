@@ -13,6 +13,7 @@ from lamia_cloud.gcp.llm.vertex import (
     get_verified_vertex_models,
     remember_verified_vertex_models,
     _get_cached_resolution,
+    _is_maas_model,
     _remember_resolved_models,
     _get_project_id,
     _region_for_provider,
@@ -226,7 +227,7 @@ class TestVertexLLMGenerate:
 
     @pytest.mark.asyncio
     @patch("lamia_cloud.gcp.llm.vertex._get_access_token", return_value="fake-token")
-    async def test_generate_meta_model_uses_maas_rawpredict(self, mock_token, llm):
+    async def test_generate_meta_maas_uses_openai_compat(self, mock_token, llm):
         request = CloudLLMRequest(
             prompt="test", model="llama-3.1-405b-instruct-maas", provider="meta", max_tokens=500
         )
@@ -248,8 +249,11 @@ class TestVertexLLMGenerate:
 
         assert result.text == "Hi there!"
         url = mock_session.post.call_args[0][0]
-        assert "publishers/meta" in url
-        assert ":rawPredict" in url
+        assert "endpoints/openapi/chat/completions" in url
+        assert ":rawPredict" not in url
+
+        payload = mock_session.post.call_args[1]["json"]
+        assert payload["model"] == "meta/llama-3.1-405b-instruct-maas"
 
     @pytest.mark.asyncio
     @patch("lamia_cloud.gcp.llm.vertex._get_access_token", return_value="fake-token")
@@ -403,13 +407,23 @@ class TestPublicAPI:
         assert is_on_cloud() is False
 
 
+class TestMaasModelDetection:
+    def test_maas_suffix_detected(self):
+        assert _is_maas_model("llama-4-maverick-17b-128e-instruct-maas") is True
+        assert _is_maas_model("qwen3-235b-a22b-instruct-2507-maas") is True
+
+    def test_non_maas_not_detected(self):
+        assert _is_maas_model("mistral-small-2503") is False
+        assert _is_maas_model("claude-sonnet-4-5") is False
+        assert _is_maas_model("gemini-2.5-flash") is False
+        assert _is_maas_model("kimi-k3") is False
+
+
 class TestProbeModelAccess:
     """Three states, not two. True/False only for a status we have direct,
-    confirmed evidence for (200 / the specific 404 "not found or no access"
-    shape). Everything else -- including 429 -- is None (inconclusive): a
-    quota/rate-limit error names a real, permitted model and fires
-    regardless of Model Garden consent, so it proves nothing about access
-    either way and must not be reported as either accessible or inaccessible."""
+    confirmed evidence for (200 / 404). Everything else -- including 429
+    -- is None (inconclusive): a quota/rate-limit error means the model
+    exists but may have zero default quota (e.g. Anthropic on Vertex)."""
 
     @pytest.fixture
     def llm(self):
@@ -459,9 +473,9 @@ class TestProbeModelAccess:
         assert await self._probe_with_status(llm, 429, body) is None
 
     @pytest.mark.asyncio
-    async def test_429_for_partner_model_is_accessible(self, llm):
-        """Partner models (meta, mistral, etc.) treat 429 as proof of access —
-        unlike Anthropic, disabled partner models return 404 not 429."""
+    async def test_429_for_partner_model_is_inconclusive(self, llm):
+        """429 is always inconclusive — it means the model exists but quota
+        is exhausted or zero.  Cannot be treated as proof of access."""
         mock_response = AsyncMock()
         mock_response.status = 429
         mock_response.text = AsyncMock(return_value='{"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}')
@@ -471,7 +485,7 @@ class TestProbeModelAccess:
         mock_session.post = MagicMock(return_value=mock_response)
         llm._session = mock_session
         with patch("lamia_cloud.gcp.llm.vertex._get_access_token", return_value="fake-token"):
-            assert await llm._probe_model_access("meta", "llama-4-maverick-17b-128e-instruct-maas") is True
+            assert await llm._probe_model_access("meta", "llama-4-maverick-17b-128e-instruct-maas") is None
 
     @pytest.mark.asyncio
     async def test_multi_region_probe_finds_model_in_alternate_region(self, llm):
@@ -527,6 +541,7 @@ class TestCheckModelAccess:
 
         llm._select_anthropic_model = fake_select
         llm._probe_model_access = fake_probe
+        llm._auto_enable_partner_model = AsyncMock(return_value=False)
 
         missing, verified, suggestions, _ = llm.check_model_access([
             ("anthropic", "claude-sonnet-4-5-20250929"),
