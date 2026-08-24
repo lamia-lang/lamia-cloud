@@ -543,7 +543,7 @@ class TestCheckModelAccess:
         llm._probe_model_access = fake_probe
         llm._auto_enable_partner_model = AsyncMock(return_value=False)
 
-        missing, verified, suggestions, _ = llm.check_model_access([
+        missing, verified, closest_found_models, _ = llm.check_model_access([
             ("anthropic", "claude-sonnet-4-5-20250929"),
             ("anthropic", "claude-opus-4-5-20251101"),
             ("anthropic", "claude-haiku-4-5-20251001"),
@@ -640,13 +640,13 @@ class TestCheckModelAccess:
         llm._load_publisher_models = fake_load
         llm._auto_enable_partner_model = AsyncMock(return_value=False)
 
-        missing, verified, suggestions, _ = llm.check_model_access([
+        missing, verified, closest_found_models, _ = llm.check_model_access([
             ("mistralai", "mistral-small-2503"),
         ])
 
         assert missing == []
         assert ("mistralai", "mistral-small-2503") in verified
-        assert ("mistralai", "mistral-small-2503") in suggestions
+        assert ("mistralai", "mistral-small-2503") in closest_found_models
 
     def test_openai_model_resolved_to_gemini_tier(self, llm):
         """openai:gpt-4 has no Vertex publisher -- check_model_access must
@@ -667,11 +667,11 @@ class TestCheckModelAccess:
         assert missing == []
         assert ("openai", "gpt-4") in verified
 
-    def test_model_in_catalog_but_inaccessible_lands_in_needs_terms(self, llm):
+    def test_model_in_catalog_but_inaccessible_lands_in_hints(self, llm):
         """meta:llama-3.3-70b-instruct-maas exists in the Model Garden
         catalog but the probe returns 404 (requires EULA acceptance).
-        It must appear in both missing and needs_terms with a direct
-        Model Garden page URL."""
+        It must appear in both missing and hints with a full sentence
+        containing the Model Garden page URL."""
         async def fake_probe(provider, model):
             return False
 
@@ -682,17 +682,19 @@ class TestCheckModelAccess:
         llm._load_publisher_models = fake_load
         llm._auto_enable_partner_model = AsyncMock(return_value=False)
 
-        missing, verified, suggestions, needs_terms = llm.check_model_access([
+        missing, verified, closest_found_models, hints = llm.check_model_access([
             ("meta", "llama-3.3-70b-instruct-maas"),
         ])
 
         assert ("meta", "llama-3.3-70b-instruct-maas") in missing
-        assert ("meta", "llama-3.3-70b-instruct-maas") in needs_terms
-        assert "publishers/meta/model-garden/llama-3.3-70b-instruct-maas" in needs_terms[("meta", "llama-3.3-70b-instruct-maas")]
+        assert ("meta", "llama-3.3-70b-instruct-maas") in hints
+        hint_text = hints[("meta", "llama-3.3-70b-instruct-maas")]
+        assert "publishers/meta/model-garden/llama-3.3-70b-instruct-maas" in hint_text
+        assert "Accept terms" in hint_text
 
-    def test_model_not_in_catalog_has_no_needs_terms_entry(self, llm):
+    def test_model_not_in_catalog_has_no_hints_entry(self, llm):
         """A typo model that doesn't exist in the catalog at all should
-        NOT appear in needs_terms -- it's a wrong name, not a EULA issue."""
+        NOT appear in hints -- it's a wrong name, not a EULA issue."""
         async def fake_probe(provider, model):
             return False
 
@@ -703,12 +705,48 @@ class TestCheckModelAccess:
         llm._load_publisher_models = fake_load
         llm._auto_enable_partner_model = AsyncMock(return_value=False)
 
-        missing, _, _, needs_terms = llm.check_model_access([
+        missing, _, _, hints = llm.check_model_access([
             ("meta", "llama-4-nonexistent-model"),
         ])
 
         assert ("meta", "llama-4-nonexistent-model") in missing
-        assert ("meta", "llama-4-nonexistent-model") not in needs_terms
+        assert ("meta", "llama-4-nonexistent-model") not in hints
+
+    def test_inconclusive_anthropic_gets_quota_hint(self, llm):
+        """An inconclusive (None) Anthropic probe should populate hints
+        with a quota-related troubleshooting sentence."""
+        async def fake_select(model):
+            return model
+
+        async def fake_probe(provider, model):
+            return None
+
+        llm._select_anthropic_model = fake_select
+        llm._probe_model_access = fake_probe
+        llm._auto_enable_partner_model = AsyncMock(return_value=False)
+
+        _, _, _, hints = llm.check_model_access([
+            ("anthropic", "claude-sonnet-4-5"),
+        ])
+
+        assert ("anthropic", "claude-sonnet-4-5") in hints
+        hint_text = hints[("anthropic", "claude-sonnet-4-5")]
+        assert "test-project-id" in hint_text
+        assert "iam-admin/quotas" in hint_text
+
+    def test_inconclusive_non_anthropic_has_no_quota_hint(self, llm):
+        """A non-Anthropic inconclusive probe should not get a quota hint."""
+        async def fake_probe(provider, model):
+            return None
+
+        llm._probe_model_access = fake_probe
+        llm._auto_enable_partner_model = AsyncMock(return_value=False)
+
+        _, _, _, hints = llm.check_model_access([
+            ("mistralai", "mistral-small-2503"),
+        ])
+
+        assert ("mistralai", "mistral-small-2503") not in hints
 
     def test_empty_input_returns_empty_lists(self, llm):
         assert llm.check_model_access([]) == ([], [], {}, {})

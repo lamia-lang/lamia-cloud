@@ -555,10 +555,10 @@ class VertexLLM(CloudLLM):
         """Check all models (every provider) for accessibility.
 
         Attempts auto-enable for partner services when possible.
-        Returns (missing, verified, suggestions, needs_terms).
+        Returns (missing, verified, closest_found_models, hints).
 
-        ``needs_terms`` maps models that exist in the catalog but require
-        manual EULA / terms acceptance to their Model Garden page URL.
+        ``hints`` maps (provider, model) pairs to ready-to-print
+        troubleshooting sentences (EULA acceptance, quota issues, etc.).
         """
         if not models:
             return [], [], {}, {}
@@ -948,11 +948,11 @@ class VertexLLM(CloudLLM):
            available names -- the first one that's accessible becomes the
            resolved substitute.
 
-        Returns (missing, verified, suggestions, needs_terms).
+        Returns (missing, verified, closest_found_models, hints).
 
-        ``needs_terms`` maps (provider, model) to the Model Garden page
-        URL for models that exist in the catalog but require manual EULA
-        or terms acceptance before they can be used.
+        ``hints`` maps (provider, model) pairs — whether missing or
+        inconclusive — to a single, ready-to-print troubleshooting
+        sentence.  Covers EULA/terms acceptance and quota issues.
         """
         try:
             resolved_pairs = []
@@ -1039,12 +1039,26 @@ class VertexLLM(CloudLLM):
                 if acc is True
             }
 
+            # Populate hints for inconclusive models (quota issues etc.)
+            hints: dict[tuple[str, str], str] = {}
+            for idx, ((provider, model), accessible) in enumerate(
+                zip(pairs, results)
+            ):
+                if accessible is None and provider == "anthropic":
+                    quota_url = _quota_filter_url(
+                        self.project_id, provider, model,
+                    )
+                    hints[(provider, model)] = (
+                        "Partner models like Anthropic's often start with "
+                        f"0 default quota on Vertex AI -- worth checking: "
+                        f"{quota_url}"
+                    )
+
             # For still-missing models, try the closest available names --
             # the first one that's accessible becomes the resolved substitute.
             # Skip _NON_VERTEX_PROVIDERS: they always map to Gemini (above),
             # not to their own publisher catalog.
-            suggestions: dict[tuple[str, str], list[str]] = {}
-            needs_terms: dict[tuple[str, str], str] = {}
+            closest_found_models: dict[tuple[str, str], list[str]] = {}
             still_missing: list[tuple[str, str]] = []
             for provider, model in missing:
                 if provider in _NON_VERTEX_PROVIDERS:
@@ -1067,7 +1081,7 @@ class VertexLLM(CloudLLM):
                 except Exception:
                     pass
                 if top:
-                    suggestions[(provider, model)] = top
+                    closest_found_models[(provider, model)] = top
 
                 selected = None
                 for alt in top:
@@ -1090,8 +1104,9 @@ class VertexLLM(CloudLLM):
                     )
                 else:
                     if model_in_catalog:
-                        needs_terms[(provider, model)] = self.model_page_url(
-                            provider, model
+                        hints[(provider, model)] = (
+                            "Accept terms in Vertex AI Model Garden: "
+                            + self.model_page_url(provider, model)
                         )
                     still_missing.append((provider, model))
 
@@ -1101,7 +1116,7 @@ class VertexLLM(CloudLLM):
         finally:
             await self.close()
 
-        return still_missing, verified, suggestions, needs_terms
+        return still_missing, verified, closest_found_models, hints
 
     async def _get_partner_service_name(self, provider: str, model: str) -> Optional[str]:
         """Extract the Cloud Partner Service name for a Model Garden model.

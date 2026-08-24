@@ -48,20 +48,24 @@ class CloudLLM(ABC):
         List[Tuple[str, str]],
         List[Tuple[str, str]],
         dict[Tuple[str, str], List[str]],
+        dict[Tuple[str, str], str],
     ]:
         """Check live access for (provider, model) pairs.
 
-        Returns (missing, verified, suggestions).
+        Returns (missing, verified, closest_found_models, hints).
         - missing: confirmed inaccessible pairs.
         - verified: confirmed accessible pairs.
-        - suggestions: maps each missing pair to closest available model names.
+        - closest_found_models: maps each missing pair to closest available model names.
+        - hints: maps a (provider, model) pair — whether missing or
+          inconclusive — to a single, ready-to-print troubleshooting sentence.
+          Callers must treat this as opaque and print it verbatim.
 
         A pair this call can't confirm either way (e.g. rate-limited) appears
         in neither missing nor verified.
 
-        Default: everything is accessible, no suggestions.
+        Default: everything is accessible, no closest_found_models, no hints.
         """
-        return [], list(models), {}
+        return [], list(models), {}, {}
 
     def catalog_display_name(self, provider: str, model: str) -> str:
         """Best-effort human-readable catalog name for `model`, for error messages.
