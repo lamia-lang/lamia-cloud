@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import urllib.parse
 import urllib.request
 from typing import Optional, Dict, Any
 
@@ -258,6 +259,32 @@ def _remember_model_regions(project_id: str, regions: dict[str, str]) -> None:
     if not regions:
         return
     _update_cache_section(project_id, _REGIONS_MAP_KEY, regions, identity_safe=False)
+
+
+def _vertex_base_model_name(provider: str, model: str) -> str:
+    """Vertex AI quota base_model identifier (shown in the quotas console).
+
+    Anthropic models are prefixed ``anthropic-`` in quota metrics;
+    other providers use the raw model name.
+    """
+    if provider == "anthropic":
+        return f"anthropic-{model}"
+    return model
+
+
+def _quota_filter_url(project_id: str, provider: str, model: str) -> str:
+    """Cloud Console quotas URL pre-filtered to a specific model's metrics."""
+    base_model = _vertex_base_model_name(provider, model)
+    filter_obj = [{"k": "", "t": 10, "v": f"\\\"base_model:{base_model}\\\"", "s": True}]
+    filter_json = json.dumps(filter_obj, separators=(",", ":"))
+    filter_encoded = urllib.parse.quote(filter_json, safe="")
+    page_state = '("allQuotasTable":("f":"' + filter_encoded + '"))'
+    return (
+        f"https://console.cloud.google.com/iam-admin/quotas"
+        f"?project={project_id}"
+        f"&service=aiplatform.googleapis.com"
+        f"&pageState={urllib.parse.quote(page_state, safe='()')}"
+    )
 
 
 def _is_maas_model(model: str) -> bool:
@@ -882,7 +909,9 @@ class VertexLLM(CloudLLM):
             except Exception:
                 pass
         elif status == 429:
-            quota_url = "https://cloud.google.com/vertex-ai/docs/generative-ai/quotas-genai"
+            quota_url = _quota_filter_url(
+                self.project_id, request.provider, request.model,
+            )
             if request.provider == "anthropic":
                 logger.warning(
                     f"Quota exceeded for {request.provider}/{request.model}. "
@@ -1207,18 +1236,32 @@ class VertexLLM(CloudLLM):
         ``_FALLBACK_PROBE_REGIONS`` since many models are region-locked
         (e.g. Meta Llama → us-east5, Gemini 3.x → global/us/eu).
 
-        Anthropic is the only provider that skips the fallback sweep
-        because it has its own region routing and 429 can't be trusted.
+        Anthropic only falls back through ``global`` and ``us`` (the
+        multi-region endpoints where Claude models are served).
         """
         primary_region = _region_for_provider(provider, self.configured_region)
         result = await self._probe_single_region(provider, model, primary_region)
         if result is True:
             return True
-        if result is None:
-            return None
 
         if provider == "anthropic":
+            # Claude models are only served at global/us/eu multi-region
+            # endpoints. If primary already tried one, try the others.
+            for fallback in ("global", "us", "eu"):
+                if fallback == primary_region:
+                    continue
+                alt = await self._probe_single_region(provider, model, fallback)
+                if alt is True:
+                    key = _model_key(provider, model)
+                    self._model_regions[key] = fallback
+                    logger.info(f"Model {provider}/{model} found in region {fallback}")
+                    return True
+                if alt is None:
+                    result = None
             return result
+
+        if result is None:
+            return None
 
         had_inconclusive = False
         for region in _FALLBACK_PROBE_REGIONS:
