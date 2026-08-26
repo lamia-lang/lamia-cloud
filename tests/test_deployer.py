@@ -100,7 +100,8 @@ class TestPackageDeployment:
 
         staging = package_deployment(tmp_path, "hello.lm", "abc123", uses_files=True)
         content = (staging / "Dockerfile").read_text()
-        assert "cd /mnt/lamia-files" in content
+        assert "mkdir -p /mnt/lamia-files/${LAMIA_FILES_NS}" in content
+        assert "cd /mnt/lamia-files/${LAMIA_FILES_NS}" in content
         assert "lamia /app/project/${LAMIA_SCRIPT}" in content
 
 

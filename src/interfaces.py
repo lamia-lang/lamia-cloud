@@ -201,8 +201,12 @@ class CloudDeployer(ABC):
         pass
 
     @abstractmethod
-    def sync_runtime_files(self, entries: list) -> dict:
-        """Sync local file references to cloud storage for runtime access."""
+    def sync_runtime_files(self, entries: list, files_namespace: str = "") -> dict:
+        """Sync local file references to cloud storage for runtime access.
+
+        When *files_namespace* is set, uploaded files are placed under that
+        subdirectory so different scripts/triggers get isolated storage.
+        """
         ...
 
     @abstractmethod
@@ -215,6 +219,7 @@ class CloudDeployer(ABC):
         uses_files: bool = False,
         deploy_mode: str = "local",
         repo_url: Optional[str] = None,
+        files_namespace: str = "",
     ) -> str:
         """Full deploy pipeline: package, build, deploy. Returns deployment name."""
         ...

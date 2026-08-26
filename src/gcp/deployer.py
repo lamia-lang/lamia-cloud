@@ -337,7 +337,12 @@ def package_deployment(
     dockerfile_dest = staging / "Dockerfile"
     dockerfile_content = (TEMPLATES_DIR / "Dockerfile").read_text()
     if uses_files:
-        cmd = f'CMD ["sh", "-c", "cd {FILES_MOUNT_PATH} && lamia /app/project/${{LAMIA_SCRIPT}} ${{LAMIA_EXTRA_ARGS:-}}"]'
+        cmd = (
+            'CMD ["sh", "-c", '
+            f'"mkdir -p {FILES_MOUNT_PATH}/${{LAMIA_FILES_NS}} '
+            f'&& cd {FILES_MOUNT_PATH}/${{LAMIA_FILES_NS}} '
+            '&& lamia /app/project/${LAMIA_SCRIPT} ${LAMIA_EXTRA_ARGS:-}"]'
+        )
     else:
         cmd = 'CMD ["sh", "-c", "cd /app/project && lamia ${LAMIA_SCRIPT} ${LAMIA_EXTRA_ARGS:-}"]'
     dockerfile_dest.write_text(dockerfile_content + cmd + "\n")
@@ -440,11 +445,26 @@ def sync_runtime_files(
     project_id: str,
     location: str,
     entries: list,
+    files_namespace: str = "",
 ) -> dict:
-    """Sync runtime file references for a remote invocation."""
+    """Sync runtime file references for a remote invocation.
+
+    When *files_namespace* is set, every bucket key is prefixed with it
+    so that different scripts/triggers get isolated subdirectories.
+    """
     if not entries:
         return {"uploaded": 0, "skipped": 0, "overwrite_warnings": []}
     files_bucket = ensure_files_bucket(project_id, location)
+    if files_namespace:
+        from lamia_cloud.contracts import FileSyncEntry
+        entries = [
+            FileSyncEntry(
+                raw_path=e.raw_path,
+                resolved_path=e.resolved_path,
+                bucket_key=f"{files_namespace}/{e.bucket_key}",
+            )
+            for e in entries
+        ]
     return sync_files_to_bucket(
         project_id=project_id,
         bucket_name=files_bucket,
@@ -514,6 +534,7 @@ def deploy_job(
     memory: str = "512Mi",
     cpu: str = "1",
     files_bucket: Optional[str] = None,
+    files_namespace: str = "",
     extra_labels: dict[str, str] | None = None,
     exec_service_account: Optional[str] = None,
     task_timeout_seconds: int = CLOUD_TASK_TIMEOUT_DEFAULT_SECONDS,
@@ -536,12 +557,16 @@ def deploy_job(
     else:
         service_account = _ensure_service_account(project_id)
 
+    env_vars = [
+        run_v2.EnvVar(name="LAMIA_SCRIPT", value=script_name),
+        run_v2.EnvVar(name="GOOGLE_CLOUD_PROJECT", value=project_id),
+    ]
+    if files_namespace:
+        env_vars.append(run_v2.EnvVar(name="LAMIA_FILES_NS", value=files_namespace))
+
     container = run_v2.Container(
         image=image_name,
-        env=[
-            run_v2.EnvVar(name="LAMIA_SCRIPT", value=script_name),
-            run_v2.EnvVar(name="GOOGLE_CLOUD_PROJECT", value=project_id),
-        ],
+        env=env_vars,
         resources=run_v2.ResourceRequirements(
             limits={"memory": memory, "cpu": cpu},
         ),
@@ -970,6 +995,7 @@ def deploy(
     deploy_mode: str = "local",
     repo_url: str | None = None,
     task_timeout_seconds: int = CLOUD_TASK_TIMEOUT_DEFAULT_SECONDS,
+    files_namespace: str = "",
 ) -> str:
     """Full deploy pipeline. Returns the deployment name.
 
@@ -1021,6 +1047,7 @@ def deploy(
         )
 
         files_bucket = None
+        ns = files_namespace or name
         if uses_files:
             files_bucket = ensure_files_bucket(project_id, location)
 
@@ -1043,6 +1070,7 @@ def deploy(
             memory=memory,
             cpu=cpu,
             files_bucket=files_bucket,
+            files_namespace=ns,
             extra_labels=resource_labels,
             exec_service_account=run_sa,
             task_timeout_seconds=task_timeout_seconds,
@@ -1227,11 +1255,12 @@ class GCPDeployer(CloudDeployer):
     def remember_verified_model_access(self, models: set) -> None:
         remember_verified_vertex_models(self.project_id, models)
 
-    def sync_runtime_files(self, entries: list) -> dict:
+    def sync_runtime_files(self, entries: list, files_namespace: str = "") -> dict:
         return sync_runtime_files(
             project_id=self.project_id,
             location=self.location,
             entries=entries,
+            files_namespace=files_namespace,
         )
 
     def deploy(
@@ -1243,6 +1272,7 @@ class GCPDeployer(CloudDeployer):
         uses_files: bool = False,
         deploy_mode: str = "local",
         repo_url: str | None = None,
+        files_namespace: str = "",
     ) -> str:
         return deploy(
             project_id=self.project_id,
@@ -1255,6 +1285,7 @@ class GCPDeployer(CloudDeployer):
             deploy_mode=deploy_mode,
             repo_url=repo_url,
             task_timeout_seconds=self.task_timeout_seconds,
+            files_namespace=files_namespace,
         )
 
     def run_job(self, target: str, verbose: bool = False) -> dict:
