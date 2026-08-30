@@ -15,6 +15,7 @@ from lamia_cloud.gcp.deployer import (
     _REQUIRED_GCP_APIS,
     _extract_capability_flags,
     _execution_from_operation,
+    _has_hidden_part,
     _result_from_execution,
     _cloud_logging_url,
     _memory_to_mib,
@@ -331,6 +332,96 @@ class TestCollectProjectFiles:
 
         assert collected == {"script.lm", "helpers.py", "config.yaml", "util.py"}
         assert ".env" not in collected
+
+    def test_excludes_dotfiles_with_collected_extensions(self, tmp_path):
+        """pathlib globs match dotfiles, so these need excluding by name."""
+        (tmp_path / "script.lm").write_text("def run(): pass")
+        (tmp_path / ".env.json").write_text('{"SECRET": "leak"}')
+        (tmp_path / ".secrets.yaml").write_text("SECRET: leak")
+        (tmp_path / ".env.production").write_text("SECRET=leak")
+
+        collected = {f.name for f in collect_project_files(tmp_path)}
+
+        assert collected == {"script.lm"}
+
+    def test_excludes_files_inside_dot_directories(self, tmp_path):
+        (tmp_path / "script.lm").write_text("def run(): pass")
+        for hidden in (".aws", ".lamia_sessions"):
+            directory = tmp_path / hidden
+            directory.mkdir()
+            (directory / "creds.yaml").write_text("SECRET: leak")
+
+        collected = {f.name for f in collect_project_files(tmp_path)}
+
+        assert collected == {"script.lm"}
+
+    def test_excludes_nested_dot_directories(self, tmp_path):
+        (tmp_path / "script.lm").write_text("def run(): pass")
+        nested = tmp_path / "lib" / ".config"
+        nested.mkdir(parents=True)
+        (nested / "creds.yaml").write_text("SECRET: leak")
+
+        collected = {f.name for f in collect_project_files(tmp_path)}
+
+        assert collected == {"script.lm"}
+
+
+class TestHasHiddenPart:
+    """Unit tests for _has_hidden_part — the dotfile/dotdir filter."""
+
+    def test_plain_file_is_not_hidden(self, tmp_path):
+        assert _has_hidden_part(tmp_path / "script.lm", tmp_path) is False
+
+    def test_dotfile_at_root(self, tmp_path):
+        assert _has_hidden_part(tmp_path / ".env", tmp_path) is True
+
+    def test_dotfile_in_subdirectory(self, tmp_path):
+        assert _has_hidden_part(tmp_path / "lib" / ".env", tmp_path) is True
+
+    def test_file_inside_dot_directory(self, tmp_path):
+        assert _has_hidden_part(tmp_path / ".secrets" / "config.yaml", tmp_path) is True
+
+    def test_dotfile_deep_in_normal_directories(self, tmp_path):
+        assert _has_hidden_part(tmp_path / "a" / "b" / "c" / ".env", tmp_path) is True
+
+    def test_normal_file_deep_in_normal_directories(self, tmp_path):
+        assert _has_hidden_part(tmp_path / "a" / "b" / "c" / "data.csv", tmp_path) is False
+
+    def test_dot_directory_mid_path(self, tmp_path):
+        assert _has_hidden_part(tmp_path / "lib" / ".config" / "settings.yaml", tmp_path) is True
+
+    def test_path_outside_project_root_is_always_hidden(self, tmp_path):
+        outside = Path("/tmp/evil/.secrets/config.yaml")
+        assert _has_hidden_part(outside, tmp_path) is True
+
+    def test_path_outside_project_root_even_if_leaf_looks_safe(self, tmp_path):
+        outside = Path("/tmp/evil/secrets/config.yaml")
+        assert _has_hidden_part(outside, tmp_path) is True
+
+
+class TestDockerignore:
+    """The build-time guard, and the only one that covers git mode."""
+
+    def staged(self, tmp_path, **kwargs):
+        (tmp_path / "hello.lm").write_text('def greet() -> str:\n    return "hi"\n')
+        staging = package_deployment(tmp_path, "hello.lm", "abc123", **kwargs)
+        return (staging / ".dockerignore").read_text()
+
+    def test_written_in_local_mode(self, tmp_path):
+        assert ".*" in self.staged(tmp_path).splitlines()
+
+    def test_written_in_git_mode(self, tmp_path):
+        """Git mode clones project files, bypassing collect_project_files."""
+        assert ".*" in self.staged(tmp_path, deploy_mode="git").splitlines()
+
+    def test_covers_nested_dotfiles(self, tmp_path):
+        """A bare pattern only matches the context root; the clone lands deeper."""
+        assert "**/.*" in self.staged(tmp_path).splitlines()
+
+    def test_covers_key_material(self, tmp_path):
+        patterns = self.staged(tmp_path).splitlines()
+        assert "**/*.pem" in patterns
+        assert "**/*.key" in patterns
 
 
 class TestDeploymentName:

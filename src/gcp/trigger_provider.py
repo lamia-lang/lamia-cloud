@@ -140,6 +140,8 @@ class GCPTriggerProvider(CloudTriggerProvider):
                 name=job_name,
                 capabilities=plan.capabilities or None,
                 files_namespace=plan.name,
+                secret_keys=plan.secret_keys,
+                secrets_namespace=plan.secrets_namespace,
             )
 
         if total_stages > 1:
@@ -171,6 +173,8 @@ class GCPTriggerProvider(CloudTriggerProvider):
                 name=job_name,
                 capabilities=plan.capabilities or None,
                 files_namespace=plan.name,
+                secret_keys=plan.secret_keys,
+                secrets_namespace=plan.secrets_namespace,
             )
 
         self._create_event_accumulation_pubsub(plan)

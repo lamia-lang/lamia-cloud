@@ -209,6 +209,27 @@ class CloudDeployer(ABC):
         """
         ...
 
+    def sync_secrets(self, secrets: dict, namespace: str) -> List[str]:
+        """Store secret values so deployments in *namespace* can read them.
+
+        Values are held by the provider's own secret store and injected as
+        environment variables at runtime; they must never be written into a
+        deployment's own configuration. Returns the key names stored.
+
+        Default: no-op for providers without a secret store.
+        """
+        return []
+
+    def cleanup_secrets(self, namespace: str) -> List[str]:
+        """Delete stored secrets for *namespace* that nothing references.
+
+        A secret shared by several deployments stays until the last one
+        referencing it is gone. Returns the key names deleted.
+
+        Default: no-op. See sync_secrets.
+        """
+        return []
+
     @abstractmethod
     def deploy(
         self,
@@ -220,8 +241,14 @@ class CloudDeployer(ABC):
         deploy_mode: str = "local",
         repo_url: Optional[str] = None,
         files_namespace: str = "",
+        secret_keys: Optional[List[str]] = None,
+        secrets_namespace: str = "",
     ) -> str:
-        """Full deploy pipeline: package, build, deploy. Returns deployment name."""
+        """Full deploy pipeline: package, build, deploy. Returns deployment name.
+
+        *secret_keys* names secrets already stored via sync_secrets that the
+        deployment reads as environment variables.
+        """
         ...
 
     @abstractmethod

@@ -81,3 +81,5 @@ class TriggerDeploymentPlan:
     mode: str = "reactive"
     cron: Optional[str] = None
     script_name: Optional[str] = None
+    secret_keys: List[str] = field(default_factory=list)
+    secrets_namespace: str = ""

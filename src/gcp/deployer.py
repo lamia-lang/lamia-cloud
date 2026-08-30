@@ -39,6 +39,12 @@ from google.cloud import (
 from google.cloud.devtools import cloudbuild_v1
 from google.iam.v1 import policy_pb2
 
+from lamia_cloud.gcp.secrets import (
+    cleanup_secrets,
+    secret_env_vars,
+    sync_secrets,
+)
+
 from lamia_cloud.contracts import (
     CLOUD_TASK_TIMEOUT_DEFAULT_SECONDS,
     CLOUD_TASK_TIMEOUT_MAX_SECONDS,
@@ -85,7 +91,21 @@ _REQUIRED_GCP_APIS = (
     "aiplatform.googleapis.com",
     "iam.googleapis.com",
     "logging.googleapis.com",
+    "secretmanager.googleapis.com",
 )
+
+# Enforced at image build time, so it also covers git mode, where project
+# files are cloned by Cloud Build instead of passing through
+# collect_project_files.  Both forms are needed: a bare pattern matches only
+# the build context root, while `**/` reaches the cloned project directory.
+DOCKERIGNORE_CONTENT = """\
+.*
+**/.*
+*.pem
+**/*.pem
+*.key
+**/*.key
+"""
 
 
 def _today_label() -> str:
@@ -296,18 +316,30 @@ def _image_name(project_id: str, name: str) -> str:
 def collect_project_files(project_root: Path) -> list[Path]:
     """Collect .lm files, config.yaml, and supporting Python files from the project.
 
-    SECURITY: .env files are explicitly excluded — secrets must never be baked
-    into Docker image layers.
+    SECURITY: nothing whose name starts with a dot is collected.
+    Files needed at runtime belong in ``with files(...)`` instead.
     """
     files = []
     for pattern in ("*.lm", "*.py", "*.yaml", "*.yml", "*.json", "*.txt", "*.csv"):
         files.extend(project_root.glob(pattern))
-    files = [f for f in files if f.name != ".env"]
     for subdir in project_root.iterdir():
         if subdir.is_dir() and not subdir.name.startswith("."):
             for pattern in ("**/*.lm", "**/*.py", "**/*.yaml", "**/*.json"):
                 files.extend(subdir.glob(pattern))
-    return files
+    return [f for f in files if not _has_hidden_part(f, project_root)]
+
+
+def _has_hidden_part(path: Path, project_root: Path) -> bool:
+    """True if any path segment below *project_root* starts with a dot.
+
+    Checks every component (directories and filename) for a leading dot.
+    Paths not under *project_root* are always treated as hidden (excluded).
+    """
+    root_parts = project_root.parts
+    path_parts = path.parts
+    if path_parts[:len(root_parts)] != root_parts:
+        return True
+    return any(part.startswith(".") for part in path_parts[len(root_parts):])
 
 
 def package_deployment(
@@ -333,6 +365,8 @@ def package_deployment(
             dest = project_dest / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(f, dest)
+
+    (staging / ".dockerignore").write_text(DOCKERIGNORE_CONTENT)
 
     dockerfile_dest = staging / "Dockerfile"
     dockerfile_content = (TEMPLATES_DIR / "Dockerfile").read_text()
@@ -538,6 +572,8 @@ def deploy_job(
     extra_labels: dict[str, str] | None = None,
     exec_service_account: Optional[str] = None,
     task_timeout_seconds: int = CLOUD_TASK_TIMEOUT_DEFAULT_SECONDS,
+    secret_keys: Optional[list[str]] = None,
+    secrets_namespace: str = "",
 ) -> None:
     """Deploy (or update) a Cloud Run Job.
 
@@ -547,6 +583,9 @@ def deploy_job(
     When *exec_service_account* is provided (git/CI mode), the job runs
     with minimal permissions.  Otherwise falls back to the shared
     ``lamia-runner`` SA for backward compatibility with local deploys.
+
+    ``secret_keys`` are referenced from Secret Manager, so their values are
+    injected at runtime rather than stored in the job spec.
     """
     client = run_v2.JobsClient()
     parent = f"projects/{project_id}/locations/{location}"
@@ -563,6 +602,8 @@ def deploy_job(
     ]
     if files_namespace:
         env_vars.append(run_v2.EnvVar(name="LAMIA_FILES_NS", value=files_namespace))
+    if secret_keys and secrets_namespace:
+        env_vars.extend(secret_env_vars(secrets_namespace, secret_keys))
 
     container = run_v2.Container(
         image=image_name,
@@ -996,6 +1037,8 @@ def deploy(
     repo_url: str | None = None,
     task_timeout_seconds: int = CLOUD_TASK_TIMEOUT_DEFAULT_SECONDS,
     files_namespace: str = "",
+    secret_keys: Optional[list[str]] = None,
+    secrets_namespace: str = "",
 ) -> str:
     """Full deploy pipeline. Returns the deployment name.
 
@@ -1074,6 +1117,8 @@ def deploy(
             extra_labels=resource_labels,
             exec_service_account=run_sa,
             task_timeout_seconds=task_timeout_seconds,
+            secret_keys=secret_keys,
+            secrets_namespace=secrets_namespace,
         )
 
         return job_name
@@ -1263,6 +1308,21 @@ class GCPDeployer(CloudDeployer):
             files_namespace=files_namespace,
         )
 
+    def sync_secrets(self, secrets: dict, namespace: str) -> list:
+        return sync_secrets(
+            project_id=self.project_id,
+            secrets=secrets,
+            namespace=namespace,
+            service_account=_ensure_service_account(self.project_id),
+        )
+
+    def cleanup_secrets(self, namespace: str) -> list:
+        return cleanup_secrets(
+            project_id=self.project_id,
+            location=self.location,
+            namespace=namespace,
+        )
+
     def deploy(
         self,
         project_root: Path,
@@ -1273,6 +1333,8 @@ class GCPDeployer(CloudDeployer):
         deploy_mode: str = "local",
         repo_url: str | None = None,
         files_namespace: str = "",
+        secret_keys: Optional[list[str]] = None,
+        secrets_namespace: str = "",
     ) -> str:
         return deploy(
             project_id=self.project_id,
@@ -1286,6 +1348,8 @@ class GCPDeployer(CloudDeployer):
             repo_url=repo_url,
             task_timeout_seconds=self.task_timeout_seconds,
             files_namespace=files_namespace,
+            secret_keys=secret_keys,
+            secrets_namespace=secrets_namespace,
         )
 
     def run_job(self, target: str, verbose: bool = False) -> dict:
