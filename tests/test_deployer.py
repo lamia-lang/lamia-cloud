@@ -609,6 +609,7 @@ class TestFetchExecutionLogs:
 class _FakeBlob:
     def __init__(self, key, existing):
         self.key = key
+        self.name = key
         self._existing = existing
         self.metadata = existing.get(key, {}).get("metadata")
         self._existing_store = existing
@@ -623,6 +624,9 @@ class _FakeBlob:
     def upload_from_filename(self, path):
         self._existing_store[self.key] = {"metadata": self.metadata, "path": path}
 
+    def delete(self):
+        self._existing_store.pop(self.key, None)
+
 
 class _FakeBucket:
     def __init__(self, existing):
@@ -630,6 +634,12 @@ class _FakeBucket:
 
     def blob(self, key):
         return _FakeBlob(key, self._existing)
+
+    def list_blobs(self, prefix=""):
+        return [
+            _FakeBlob(k, self._existing) for k in sorted(self._existing)
+            if k.startswith(prefix)
+        ]
 
 
 class _FakeStorageClient:
@@ -679,6 +689,80 @@ class TestIncrementalFileSync:
         result = sync_files_to_bucket("proj", "bucket", plan)
         assert result["uploaded"] == 1
         assert len(result["overwrite_warnings"]) == 1
+
+
+class TestDeleteSync:
+    """Deleting locally removed files from the remote bucket."""
+
+    def _client(self, monkeypatch, existing):
+        fake = _FakeStorageClient(existing)
+        monkeypatch.setattr(
+            deployer_module.storage, "Client", lambda project: fake,
+        )
+        return existing
+
+    def test_deletes_stale_blob_under_prefix(self, tmp_path, monkeypatch):
+        local = tmp_path / "keep.txt"
+        local.write_text("hello")
+
+        from lamia_cloud.file_sync import file_sha256
+        sha = file_sha256(str(local))
+
+        store = self._client(monkeypatch, {
+            "ns/keep.txt": {"metadata": {"lamia-sha256": sha}, "path": "old"},
+            "ns/gone.txt": {"metadata": {"lamia-sha256": "old"}, "path": "old"},
+        })
+
+        plan = [FileSyncEntry(raw_path="keep.txt", resolved_path=str(local), bucket_key="ns/keep.txt")]
+        result = sync_files_to_bucket("proj", "bucket", plan, prefix="ns")
+
+        assert result["deleted"] == 1
+        assert result["skipped"] == 1
+        assert "ns/keep.txt" in store
+        assert "ns/gone.txt" not in store
+
+    def test_does_not_delete_without_prefix(self, tmp_path, monkeypatch):
+        local = tmp_path / "a.txt"
+        local.write_text("hello")
+
+        store = self._client(monkeypatch, {
+            "orphan.txt": {"metadata": {"lamia-sha256": "x"}, "path": "old"},
+        })
+
+        plan = [FileSyncEntry(raw_path="a.txt", resolved_path=str(local), bucket_key="a.txt")]
+        result = sync_files_to_bucket("proj", "bucket", plan, prefix="")
+
+        assert result["deleted"] == 0
+        assert "orphan.txt" in store
+
+    def test_does_not_delete_non_lamia_blobs(self, tmp_path, monkeypatch):
+        """Manually uploaded objects (no lamia-sha256 metadata) are left alone."""
+        local = tmp_path / "keep.txt"
+        local.write_text("hello")
+
+        store = self._client(monkeypatch, {
+            "ns/manual.txt": {"metadata": {}, "path": "old"},
+        })
+
+        plan = [FileSyncEntry(raw_path="keep.txt", resolved_path=str(local), bucket_key="ns/keep.txt")]
+        result = sync_files_to_bucket("proj", "bucket", plan, prefix="ns")
+
+        assert result["deleted"] == 0
+        assert "ns/manual.txt" in store
+
+    def test_does_not_delete_blobs_outside_prefix(self, tmp_path, monkeypatch):
+        local = tmp_path / "a.txt"
+        local.write_text("hello")
+
+        store = self._client(monkeypatch, {
+            "other-ns/file.txt": {"metadata": {"lamia-sha256": "x"}, "path": "old"},
+        })
+
+        plan = [FileSyncEntry(raw_path="a.txt", resolved_path=str(local), bucket_key="ns/a.txt")]
+        result = sync_files_to_bucket("proj", "bucket", plan, prefix="ns")
+
+        assert result["deleted"] == 0
+        assert "other-ns/file.txt" in store
 
 
 class TestRunJob:

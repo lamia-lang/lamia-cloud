@@ -438,8 +438,14 @@ def sync_files_to_bucket(
     project_id: str,
     bucket_name: str,
     entries: list,
+    files_namespace: str = "",
 ) -> dict:
-    """Incrementally sync planned files to GCS and report overwrites."""
+    """Incrementally sync planned files to GCS, uploading changes and
+    deleting remote objects that are no longer referenced locally.
+
+    When *files_namespace* is set, only remote objects under that namespace are
+    considered for deletion — objects outside the prefix are never touched.
+    """
     client = storage.Client(project=project_id)
     bucket = client.bucket(bucket_name)
 
@@ -448,9 +454,12 @@ def sync_files_to_bucket(
     overwrite_warnings: list[str] = []
     total = len(entries)
 
+    desired_keys: set[str] = set()
+
     for i, entry in enumerate(entries, 1):
         local_path = entry.resolved_path
         key = entry.bucket_key
+        desired_keys.add(key)
         local_sha = file_sha256(local_path)
 
         blob = bucket.blob(key)
@@ -468,11 +477,45 @@ def sync_files_to_bucket(
         uploaded += 1
         logger.info(f"  [{i}/{total}] Uploaded: {key}")
 
+    deleted = _delete_stale_blobs(bucket, bucket_name, files_namespace, desired_keys)
+
     return {
         "uploaded": uploaded,
         "skipped": skipped,
+        "deleted": deleted,
         "overwrite_warnings": overwrite_warnings,
     }
+
+
+def _delete_stale_blobs(
+    bucket,
+    bucket_name: str,
+    files_namespace: str,
+    desired_keys: set[str],
+) -> int:
+    """Remove blobs under *files_namespace* that are not in *desired_keys*.
+
+    Only blobs carrying lamia metadata (``lamia-sha256``) are deleted —
+    manually uploaded objects are left alone to avoid surprises.
+    Returns the number of deleted blobs.
+    """
+    if not files_namespace:
+        return 0
+
+    deleted = 0
+    list_prefix = files_namespace.rstrip("/") + "/"
+    for blob in bucket.list_blobs(prefix=list_prefix):
+        if blob.name in desired_keys:
+            continue
+        blob.reload()
+        if not (blob.metadata or {}).get("lamia-sha256"):
+            logger.info(f"  Skipping non-lamia blob: {blob.name}")
+            continue
+        logger.info(f"  Deleting stale: gs://{bucket_name}/{blob.name}")
+        blob.delete()
+        deleted += 1
+
+    return deleted
 
 
 def sync_runtime_files(
@@ -503,6 +546,7 @@ def sync_runtime_files(
         project_id=project_id,
         bucket_name=files_bucket,
         entries=entries,
+        files_namespace=files_namespace,
     )
 
 
