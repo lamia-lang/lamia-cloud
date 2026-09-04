@@ -714,7 +714,7 @@ class TestDeleteSync:
         })
 
         plan = [FileSyncEntry(raw_path="keep.txt", resolved_path=str(local), bucket_key="ns/keep.txt")]
-        result = sync_files_to_bucket("proj", "bucket", plan, prefix="ns")
+        result = sync_files_to_bucket("proj", "bucket", plan, files_namespace="ns")
 
         assert result["deleted"] == 1
         assert result["skipped"] == 1
@@ -730,7 +730,7 @@ class TestDeleteSync:
         })
 
         plan = [FileSyncEntry(raw_path="a.txt", resolved_path=str(local), bucket_key="a.txt")]
-        result = sync_files_to_bucket("proj", "bucket", plan, prefix="")
+        result = sync_files_to_bucket("proj", "bucket", plan, files_namespace="")
 
         assert result["deleted"] == 0
         assert "orphan.txt" in store
@@ -745,7 +745,7 @@ class TestDeleteSync:
         })
 
         plan = [FileSyncEntry(raw_path="keep.txt", resolved_path=str(local), bucket_key="ns/keep.txt")]
-        result = sync_files_to_bucket("proj", "bucket", plan, prefix="ns")
+        result = sync_files_to_bucket("proj", "bucket", plan, files_namespace="ns")
 
         assert result["deleted"] == 0
         assert "ns/manual.txt" in store
@@ -759,7 +759,7 @@ class TestDeleteSync:
         })
 
         plan = [FileSyncEntry(raw_path="a.txt", resolved_path=str(local), bucket_key="ns/a.txt")]
-        result = sync_files_to_bucket("proj", "bucket", plan, prefix="ns")
+        result = sync_files_to_bucket("proj", "bucket", plan, files_namespace="ns")
 
         assert result["deleted"] == 0
         assert "other-ns/file.txt" in store
